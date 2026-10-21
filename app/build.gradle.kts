@@ -1,24 +1,55 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+val releaseSigningProperties = Properties().apply {
+    rootProject.file("key.properties").takeIf { it.isFile }?.inputStream()?.use { load(it) }
+}
+val releaseStoreFile = releaseSigningProperties.getProperty("storeFile")
+    ?: providers.environmentVariable("AV_RELEASE_STORE_FILE").orNull
+val releaseStorePassword = releaseSigningProperties.getProperty("storePassword")
+    ?: providers.environmentVariable("AV_RELEASE_STORE_PASSWORD").orNull
+val releaseKeyAlias = releaseSigningProperties.getProperty("keyAlias")
+    ?: providers.environmentVariable("AV_RELEASE_KEY_ALIAS").orNull
+val releaseKeyPassword = releaseSigningProperties.getProperty("keyPassword")
+    ?: providers.environmentVariable("AV_RELEASE_KEY_PASSWORD").orNull
+val hasReleaseSigning = listOf(releaseStoreFile, releaseStorePassword, releaseKeyAlias, releaseKeyPassword)
+    .all { !it.isNullOrBlank() } && file(releaseStoreFile!!).isFile
+
 android {
     namespace = "com.audienceverdict.app"
-    compileSdk = 35
+    compileSdk = 36
     defaultConfig {
         applicationId = "com.audienceverdict.app"
         minSdk = 26
-        targetSdk = 35
+        targetSdk = 36
         versionCode = 1
         versionName = "1.0.0"
-        buildConfigField("String", "API_BASE_URL", "\"${providers.gradleProperty("apiBaseUrl").orElse("http://192.168.29.140:8080/api/v1/").get()}\"")
+        buildConfigField("String", "API_BASE_URL", "\"${providers.gradleProperty("apiBaseUrl").orElse("https://api.audienceverdict.in/api/v1/").get()}\"")
     }
     buildFeatures { compose = true; buildConfig = true }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     kotlinOptions { jvmTarget = "17" }
     packaging { resources.excludes += "/META-INF/{AL2.0,LGPL2.1}" }
+    if (hasReleaseSigning) {
+        signingConfigs {
+            create("release") {
+                storeFile = file(releaseStoreFile!!)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
+    }
+    buildTypes {
+        getByName("release") {
+            if (hasReleaseSigning) signingConfig = signingConfigs.getByName("release")
+        }
+    }
 }
 
 dependencies {

@@ -2,5 +2,9 @@
 .idea/
 /build/
 /app/build/
+/release-output/
 local.properties
+key.properties
+*.jks
+*.keystore
 *.iml

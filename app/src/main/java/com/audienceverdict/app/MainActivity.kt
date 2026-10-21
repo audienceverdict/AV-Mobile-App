@@ -92,8 +92,10 @@ class MainActivity : ComponentActivity() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
         window.statusBarColor = android.graphics.Color.TRANSPARENT
         window.navigationBarColor = android.graphics.Color.TRANSPARENT
-        window.isNavigationBarContrastEnforced = false
-        window.isStatusBarContrastEnforced = false
+        if(android.os.Build.VERSION.SDK_INT>=android.os.Build.VERSION_CODES.Q) {
+            window.isNavigationBarContrastEnforced = false
+            window.isStatusBarContrastEnforced = false
+        }
         setContent { AVTheme { AVApp() } }
     }
 
@@ -105,6 +107,13 @@ class MainActivity : ComponentActivity() {
 }
 
 private object PendingAvNotification { val intent=mutableStateOf<Intent?>(null) }
+
+private object DeviceLocationCache {
+    var city by mutableStateOf<String?>(null)
+    var enabled by mutableStateOf(false)
+    var checked by mutableStateOf(false)
+    var refreshing by mutableStateOf(false)
+}
 
 @Composable private fun AVTheme(content: @Composable () -> Unit) {
     MaterialTheme(colorScheme = darkColorScheme(primary=Red, background=Ink, surface=Panel, onBackground=Color.White, onSurface=Color.White), content=content)
@@ -129,11 +138,11 @@ data class Me(val id:String?=null,val name:String?=null,val email:String?=null,@
 data class UpdateProfilePayload(val name:String,val email:String,val alternativeMobile:String?=null)
 data class AvNotification(val id:String?=null,val title:String?=null,val message:String?=null,val body:String?=null,val type:String?=null,val createdAt:String?=null,val read:Boolean?=null,val movieId:String?=null,val movieTitle:String?=null,val bookingId:String?=null,val targetId:String?=null)
 data class WaitingListRequest(val showId:String,val requestedSeatsCount:Int=1)
-data class WaitingListEntry(val id:String="",val showId:String="",val userId:String?=null,val requestedSeatsCount:Int=1,val position:Int?=null,val status:String="WAITING",val offerExpiresAt:String?=null,val createdAt:String?=null,val updatedAt:String?=null)
+data class WaitingListEntry(val id:String="",val showId:String="",val userId:String?=null,val requestedSeatsCount:Int=1,val status:String="WAITING",val offerExpiresAt:String?=null,@SerializedName(value="offeredSeatIds",alternate=["seatIds","offeredSeats"]) val offeredSeatIds:List<String>?=null,val createdAt:String?=null,val updatedAt:String?=null)
 data class Show(val id:String="",val movieId:String="",val theatreId:String="",val date:String="",val startTime:String="",val ticketType:String="",val ticketPrice:Double=0.0,val status:String="",val seatPrices:Map<String,Double>?=null,val maxTicketsPerMobile:Int?=null,val holdMinutes:Int?=null)
 data class Theatre(val id:String="",val name:String="",val address:String?=null,val city:String?=null)
 data class Review(val id:String="",val userId:String?=null,val author:String?=null,val title:String?=null,val text:String?=null,val rating:Int?=null,val status:String?=null,val thumbnail:String?=null,val createdAt:String?=null)
-data class BookingRecord(val id:String="",val showId:String="",val seatIds:List<String> = emptyList(),val ticketCount:Int=0,val totalAmount:Double=0.0,val status:String="",val confirmationStatus:String?=null,val attended:Boolean=false,val movie:String?=null,val theatre:String?=null,val screen:String?=null,val date:String?=null,val time:String?=null,val mobile:String?=null,val email:String?=null,val notification:String?=null,val cancellationReason:String?=null,val ticketCode:String?=null,val createdAt:String?=null,val updatedAt:String?=null)
+data class BookingRecord(val id:String="",val showId:String="",val seatIds:List<String> = emptyList(),val ticketCount:Int=0,val totalAmount:Double=0.0,val status:String="",val confirmationStatus:String?=null,val attended:Boolean=false,val movie:String?=null,val theatre:String?=null,val screen:String?=null,val date:String?=null,val time:String?=null,val mobile:String?=null,val email:String?=null,val notification:String?=null,val cancellationReason:String?=null,val ticketCode:String?=null,val createdAt:String?=null,val updatedAt:String?=null,val waitingListEntryId:String?=null)
 private data class BookingCondition(val title:String,val description:String,val imageRes:Int)
 private val BookingConditions=listOf(
     BookingCondition("Stay connected for confirmation","The cinema may contact you by call or email if your booking needs confirmation. Keep your contact details available.",R.drawable.terms_condition_contact),
@@ -198,8 +207,17 @@ private object AvClient {
 
 @Composable private fun AVApp() {
     val nav= rememberNavController()
+    val context=LocalContext.current
+    val locationScope= rememberCoroutineScope()
+    val lifecycleOwner=LocalLifecycleOwner.current
     val registrationDraft= remember { RegistrationDraft() }
     var signedIn by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit){refreshDeviceLocationCache(context)}
+    DisposableEffect(lifecycleOwner) {
+        val observer=LifecycleEventObserver{_,event->if(event==Lifecycle.Event.ON_RESUME)locationScope.launch{refreshDeviceLocationCache(context)}}
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose{lifecycleOwner.lifecycle.removeObserver(observer)}
+    }
     NavHost(navController=nav,startDestination="splash") {
         composable("splash") { Splash { destination ->
             if(destination == "home") signedIn=true
@@ -225,8 +243,8 @@ private object AvClient {
         composable("settings") { Shell(nav,"profile",signedIn){ SimpleAccountPage("Settings","Manage your Audience Verdict account preferences.") } }
         composable("details/{id}",arguments=listOf(navArgument("id"){type=NavType.StringType})){ e-> Shell(nav,"movies",signedIn){Details(nav,e.arguments?.getString("id").orEmpty())} }
         composable("shows/{id}",arguments=listOf(navArgument("id"){type=NavType.StringType})){ e-> Shell(nav,"movies",signedIn){ShowList(nav,e.arguments?.getString("id").orEmpty())} }
-        composable("seats/{showId}",arguments=listOf(navArgument("showId"){type=NavType.StringType})){ e-> Shell(nav,"movies",signedIn){SeatInfo(nav,e.arguments?.getString("showId").orEmpty())} }
-        composable("terms/{showId}?seats={seats}&expires={expires}",arguments=listOf(navArgument("showId"){type=NavType.StringType},navArgument("seats"){type=NavType.StringType;defaultValue=""},navArgument("expires"){type=NavType.StringType;defaultValue=""})){e->Shell(nav,"movies",signedIn){BookingTermsScreen(nav,e.arguments?.getString("showId").orEmpty(),e.arguments?.getString("seats").orEmpty(),e.arguments?.getString("expires").orEmpty())}}
+        composable("seats/{showId}?waitlistEntryId={waitlistEntryId}",arguments=listOf(navArgument("showId"){type=NavType.StringType},navArgument("waitlistEntryId"){type=NavType.StringType;defaultValue=""})){ e-> Shell(nav,"movies",signedIn){SeatInfo(nav,e.arguments?.getString("showId").orEmpty(),e.arguments?.getString("waitlistEntryId").orEmpty())} }
+        composable("terms/{showId}?seats={seats}&expires={expires}&waitlistEntryId={waitlistEntryId}",arguments=listOf(navArgument("showId"){type=NavType.StringType},navArgument("seats"){type=NavType.StringType;defaultValue=""},navArgument("expires"){type=NavType.StringType;defaultValue=""},navArgument("waitlistEntryId"){type=NavType.StringType;defaultValue=""})){e->Shell(nav,"movies",signedIn){BookingTermsScreen(nav,e.arguments?.getString("showId").orEmpty(),e.arguments?.getString("seats").orEmpty(),e.arguments?.getString("expires").orEmpty(),e.arguments?.getString("waitlistEntryId").orEmpty())}}
         composable("booking-ticket/{id}",arguments=listOf(navArgument("id"){type=NavType.StringType})){e->Shell(nav,"profile",signedIn){BookingTicketScreen(nav,e.arguments?.getString("id").orEmpty())}}
         composable("bookings"){ Shell(nav,"profile",signedIn){ Bookings(nav) } }
         composable("review/{id}",arguments=listOf(navArgument("id"){type=NavType.StringType})){e-> Shell(nav,"movies",signedIn){ReviewPage(e.arguments?.getString("id").orEmpty(),nav)} }
@@ -324,7 +342,6 @@ private object AvClient {
 }
 
 private val requiredPermissions = arrayOf(
-    android.Manifest.permission.READ_CONTACTS,
     android.Manifest.permission.ACCESS_COARSE_LOCATION
 )
 
@@ -349,11 +366,17 @@ private fun apiErrorMessage(error:Throwable,context:Context?=null):String {
             val json=com.google.gson.JsonParser.parseString(raw)
             if(json.isJsonObject) {
                 val obj=json.asJsonObject
-                listOf("message","detail","error","title").firstNotNullOfOrNull{key->obj.get(key)?.takeIf{it.isJsonPrimitive}?.asString}
-                    ?: obj.get("fieldErrors")?.takeIf{!it.isJsonNull}?.toString()?.takeIf{it!="{}"&&it!="[]"}?.let{"Validation: $it"}
+                val fields=obj.get("fieldErrors")?.takeIf{!it.isJsonNull}?.toString()?.takeIf{it!="{}"&&it!="[]"}
+                val message=listOf("message","detail","title","errorDescription").firstNotNullOfOrNull{key->obj.get(key)?.takeIf{it.isJsonPrimitive}?.asString?.takeIf{it.isNotBlank()}}
+                when {
+                    message!=null&&fields!=null -> "$message ($fields)"
+                    message!=null -> message
+                    fields!=null -> "Validation: $fields"
+                    else -> listOf("error","code","errorCode").firstNotNullOfOrNull{key->obj.get(key)?.takeIf{it.isJsonPrimitive}?.asString?.takeIf{it.isNotBlank()}}
+                }
             } else null
         }.getOrNull()
-        return "Server issue (HTTP ${http.code()}): ${detail?:"the service could not complete this request. Please try again later."}"
+        return "Server issue (HTTP ${http.code()}): ${detail?:raw.takeIf{it.isNotBlank()}?.take(240)?:"the service could not complete this request. Please try again later."}"
     }
     if(cause is java.net.UnknownHostException || (cause is java.io.IOException && context!=null && !hasValidatedInternet(context)))
         return "Network issue: the internet connection could not reach Audience Verdict. Check your connection and retry."
@@ -370,6 +393,7 @@ private fun networkUnavailableMessage()="Network issue: no internet connection i
     val lifecycleOwner=LocalLifecycleOwner.current
     var granted by remember { mutableStateOf(hasRequiredPermissions(context)) }
     var requested by remember { mutableStateOf(false) }
+    val locationGranted=ContextCompat.checkSelfPermission(context,android.Manifest.permission.ACCESS_COARSE_LOCATION)==PackageManager.PERMISSION_GRANTED
     val permissionLauncher=rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
         requested=true
         granted=hasRequiredPermissions(context)
@@ -383,23 +407,34 @@ private fun networkUnavailableMessage()="Network issue: no internet connection i
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
-    Column(Modifier.fillMaxSize().background(Ink).verticalScroll(rememberScrollState())
-        .padding(top=WindowInsets.statusBars.asPaddingValues().calculateTopPadding()+28.dp,bottom=WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()+24.dp)
-        .padding(horizontal=24.dp),horizontalAlignment=Alignment.CenterHorizontally) {
-        Logo(); Spacer(Modifier.height(34.dp)); Text("A couple of permissions",fontSize=22.sp,fontWeight=FontWeight.Bold)
-        Text("Contacts and Location access are required to continue in this app.",Modifier.padding(top=8.dp,bottom=20.dp),color=Muted,textAlign=TextAlign.Center)
-        listOf("Location" to "Allow Audience Verdict to access your device location.","Contacts" to "Allow Audience Verdict to access contacts on this device.").forEach { (title,detail) ->
-            Row(Modifier.fillMaxWidth().padding(vertical=6.dp).background(Panel,RoundedCornerShape(12.dp)).padding(16.dp),verticalAlignment=Alignment.CenterVertically) {
-                Icon(if(title=="Location") Icons.Default.LocationOn else Icons.Default.Contacts,title,tint=Red)
-                Column(Modifier.padding(start=14.dp)) { Text(title,fontWeight=FontWeight.SemiBold); Text(detail,color=Muted,fontSize=12.sp) }
+    Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF17090C),Ink,Color(0xFF080A0B))))) {
+        Box(Modifier.align(Alignment.TopCenter).padding(top=80.dp).size(230.dp).background(Red.copy(alpha=.08f),CircleShape))
+        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())
+            .padding(top=WindowInsets.statusBars.asPaddingValues().calculateTopPadding()+18.dp,bottom=WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()+22.dp)
+            .padding(horizontal=22.dp),horizontalAlignment=Alignment.CenterHorizontally) {
+            Logo()
+            Text("A couple of permissions",Modifier.padding(top=12.dp),fontSize=25.sp,lineHeight=30.sp,fontWeight=FontWeight.Bold,color=Color.White,textAlign=TextAlign.Center)
+            Text("Allow these so Audience Verdict can show local cinemas and support the app features you use.",Modifier.padding(top=8.dp,bottom=22.dp),fontSize=14.sp,lineHeight=20.sp,color=Color(0xFFE0E4E8),textAlign=TextAlign.Center)
+            listOf(
+                Icons.Default.LocationOn to Triple("Location","Used to find your live city and show nearby cinemas.",locationGranted)
+            ).forEach{(icon,details)->
+                val (title,detail,isGranted)=details
+                Row(Modifier.fillMaxWidth().padding(vertical=6.dp).border(1.dp,if(isGranted)Color(0xFF26764E) else Color(0xFF51252A),RoundedCornerShape(17.dp)).background(Color(0xE914181B),RoundedCornerShape(17.dp)).padding(16.dp),verticalAlignment=Alignment.CenterVertically) {
+                    Box(Modifier.size(54.dp).background(if(isGranted)Color(0xFF153323) else Color(0xFF35171B),RoundedCornerShape(16.dp)),contentAlignment=Alignment.Center){Icon(icon,title,Modifier.size(29.dp),tint=if(isGranted)Color(0xFF53D990) else Red)}
+                    Column(Modifier.weight(1f).padding(start=14.dp,end=6.dp)) {
+                        Text(title,fontSize=16.sp,fontWeight=FontWeight.Bold,color=Color.White)
+                        Text(detail,Modifier.padding(top=4.dp),fontSize=12.sp,lineHeight=17.sp,color=Color(0xFFD0D6DB))
+                    }
+                    Text(if(isGranted)"Allowed" else "Required",fontSize=10.sp,fontWeight=FontWeight.Bold,color=if(isGranted)Color(0xFF53D990) else Color(0xFFFF9DA3))
+                }
             }
+            if(!granted && requested) Text("Location permission is required to continue. If you denied access, enable it in Android Settings.",Modifier.fillMaxWidth().padding(top=12.dp),fontSize=12.sp,lineHeight=17.sp,color=Color(0xFFFFA1A8),textAlign=TextAlign.Center)
+            Spacer(Modifier.height(18.dp))
+            if(!granted) Button(onClick={permissionLauncher.launch(requiredPermissions)},Modifier.fillMaxWidth().height(56.dp),colors=ButtonDefaults.buttonColors(containerColor=Red),shape=RoundedCornerShape(14.dp)) {
+                Text(if(requested) "Allow permissions" else "Continue",fontSize=16.sp,fontWeight=FontWeight.Bold,color=Color.White)
+            }
+            if(!granted && requested) TextButton(onClick={context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,Uri.fromParts("package",context.packageName,null)))}) { Text("Open app settings",fontSize=14.sp,color=Color(0xFFD8DDE1)) }
         }
-        if(!granted && requested) Text("Both permissions are needed to continue. You can enable them in Android Settings.",Modifier.padding(top=12.dp),color=Red,fontSize=12.sp,textAlign=TextAlign.Center)
-        Spacer(Modifier.height(18.dp))
-        if(!granted) Button(onClick={permissionLauncher.launch(requiredPermissions)},Modifier.fillMaxWidth().height(52.dp),colors=ButtonDefaults.buttonColors(containerColor=Red),shape=RoundedCornerShape(12.dp)) {
-            Text(if(requested) "Allow Permissions" else "Continue")
-        }
-        if(!granted && requested) TextButton(onClick={context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,Uri.fromParts("package",context.packageName,null)))}) { Text("Open Settings",color=Muted) }
     }
     LaunchedEffect(granted) { if(granted) onAllowed() }
 }
@@ -561,16 +596,27 @@ private fun networkUnavailableMessage()="Network issue: no internet connection i
 
 @Composable private fun Home(nav:androidx.navigation.NavHostController) {
     var movies by remember { mutableStateOf<List<Movie>>(emptyList()) }; var error by remember { mutableStateOf("") }; var busy by remember { mutableStateOf(true) }
+    var waitlistEntries by remember { mutableStateOf<List<WaitingListEntry>>(emptyList()) }
     val context=LocalContext.current
     LaunchedEffect(Unit){try{movies=AvClient.api.movies().content}catch(t:Throwable){error=apiErrorMessage(t,context)}finally{busy=false}}
+    LaunchedEffect(Unit){while(isActive){try{val entries=AvClient.api.waitingList().filter{it.status.uppercase() in setOf("WAITING","OFFERED")};waitlistEntries=entries.filter{entry->runCatching{val a=parseAvailability(AvClient.api.availability(entry.showId));val unavailable=(a.bookedSeatIds+a.heldSeatIds+a.reservedSeatIds+a.waitlistReservedSeatIds).toSet();a.layout?.seats.orEmpty().any{!it.disabled&&it.id !in unavailable}}.getOrDefault(false)}}catch(_:Throwable){};delay(5000)}}
     Column(Modifier.fillMaxSize().background(Ink).verticalScroll(rememberScrollState()).padding(bottom=20.dp)) {
         Row(Modifier.fillMaxWidth().padding(18.dp),verticalAlignment=Alignment.CenterVertically){Text("AV",color=Red,fontSize=30.sp,fontWeight=FontWeight.Black); Spacer(Modifier.width(16.dp)); Text("?  Hyderabad",Modifier.weight(1f),fontSize=14.sp); Icon(Icons.Default.Search,"Search",Modifier.clickable{nav.navigate("movies")}); Spacer(Modifier.width(16.dp)); Icon(Icons.Default.Notifications,"Notifications",tint=Red)}
-        if(movies.isNotEmpty()) { val featured=movies.firstOrNull{!it.backdropUrl.isNullOrBlank()}?:movies.first(); Box(Modifier.fillMaxWidth().height(250.dp).padding(horizontal=14.dp).clickable{nav.navigate("details/${featured.id}")}) { Poster(featured.backdropUrl?:featured.posterUrl,Modifier.fillMaxSize()); Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color.Transparent,Ink.copy(alpha=.96f)),startY=90f))); Column(Modifier.align(Alignment.BottomStart).padding(20.dp)){Text(featured.title,fontSize=26.sp,fontWeight=FontWeight.Black); Text(featured.genre?.joinToString(" • ")?:"",color=Muted); Button(onClick={nav.navigate("details/${featured.id}")},colors=ButtonDefaults.buttonColors(containerColor=Red)){Text("Book Now")}} } }
+        waitlistEntries.forEach { entry ->
+            Column(Modifier.fillMaxWidth().padding(horizontal=14.dp, vertical=6.dp).clip(RoundedCornerShape(14.dp)).background(Color(0xFF321316)).border(1.dp,Red.copy(alpha=.7f),RoundedCornerShape(14.dp)).padding(15.dp)) {
+                Text("TICKETS AVAILABLE",fontSize=11.sp,fontWeight=FontWeight.Black,letterSpacing=1.sp,color=Color(0xFFFFA3A7))
+                Text("Seats are available for your show",Modifier.padding(top=4.dp),fontSize=19.sp,fontWeight=FontWeight.Bold,color=Color.White)
+                Text("Available seats are open to everyone. Choose from the current seat layout.",Modifier.padding(top=4.dp),fontSize=12.sp,color=Color(0xFFE6DADB))
+                Button(onClick={nav.navigate("seats/${Uri.encode(entry.showId)}?waitlistEntryId=${Uri.encode(entry.id)}")},Modifier.fillMaxWidth().padding(top=8.dp),colors=ButtonDefaults.buttonColors(containerColor=Red),shape=RoundedCornerShape(24.dp)){Text("Book tickets and select seats",color=Color.White,fontWeight=FontWeight.Bold)}
+            }
+        }
+        if(movies.isNotEmpty()) Row(Modifier.fillMaxWidth().padding(horizontal=14.dp).clip(RoundedCornerShape(10.dp)).background(Panel).clickable{nav.navigate("movies")}.padding(horizontal=12.dp,vertical=10.dp),verticalAlignment=Alignment.CenterVertically){Text("NOW SHOWING",fontSize=10.sp,fontWeight=FontWeight.Black,letterSpacing=1.sp,color=Red);Text(movies.joinToString("     •     "){it.title},Modifier.weight(1f).padding(start=12.dp).basicMarquee(iterations=Int.MAX_VALUE),maxLines=1,fontSize=13.sp,fontWeight=FontWeight.SemiBold,color=Color.White)}
+        if(movies.isNotEmpty()) { val featured=movies.firstOrNull{!it.backdropUrl.isNullOrBlank()}?:movies.first(); Box(Modifier.fillMaxWidth().height(250.dp).padding(horizontal=14.dp).clickable{nav.navigate("details/${featured.id}")}) { Poster(featured.backdropUrl?:featured.posterUrl,Modifier.fillMaxSize()); Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color.Transparent,Ink.copy(alpha=.96f)),startY=90f))); Column(Modifier.align(Alignment.BottomStart).padding(20.dp)){Text(featured.title,fontSize=26.sp,fontWeight=FontWeight.Black); Text(featured.genre?.joinToString("  -  ")?:"",color=Muted); Button(onClick={nav.navigate("details/${featured.id}")},colors=ButtonDefaults.buttonColors(containerColor=Red)){Text("Book Now")}} } }
         SectionTitle("Trending Movies",onClick={nav.navigate("movies")}); if(busy) Busy() else if(error.isNotBlank()) ErrorCard(error) else PosterRow(movies.filter{it.status!="UPCOMING"}.ifEmpty{movies},nav)
         SectionTitle("Coming Soon",onClick={nav.navigate("movies")}); PosterRow(movies.filter{it.status=="UPCOMING"},nav)
     }
 }
-@Composable private fun SectionTitle(title:String,onClick:()->Unit){Row(Modifier.fillMaxWidth().padding(start=16.dp,end=16.dp,top=18.dp,bottom=10.dp),verticalAlignment=Alignment.CenterVertically){Text(title,Modifier.weight(1f),fontSize=19.sp,fontWeight=FontWeight.Bold); Text("See All ›",Modifier.clickable{onClick()},color=Red,fontSize=13.sp)}}
+@Composable private fun SectionTitle(title:String,onClick:()->Unit){Row(Modifier.fillMaxWidth().padding(start=16.dp,end=16.dp,top=18.dp,bottom=10.dp),verticalAlignment=Alignment.CenterVertically){Text(title,Modifier.weight(1f),fontSize=19.sp,fontWeight=FontWeight.Bold); Text("See All >",Modifier.clickable{onClick()},color=Red,fontSize=13.sp)}}
 @Composable private fun PosterRow(list:List<Movie>,nav:androidx.navigation.NavHostController){LazyRow(contentPadding=PaddingValues(horizontal=14.dp),horizontalArrangement=Arrangement.spacedBy(12.dp)){items(list){m-> Column(Modifier.width(126.dp).clickable{nav.navigate("details/${m.id}")}){Poster(m.posterUrl,Modifier.fillMaxWidth().height(176.dp)); Text(m.title,maxLines=1,fontWeight=FontWeight.SemiBold,modifier=Modifier.padding(top=6.dp)); Text(m.genre?.firstOrNull()?:m.genres?.firstOrNull()?:"",color=Muted,fontSize=11.sp,maxLines=1)}}}}
 @Composable private fun Poster(url:String?,modifier:Modifier=Modifier){
     val context=LocalContext.current
@@ -616,8 +662,8 @@ private suspend fun resolvePosterPageImage(link:String):String? = withContext(Di
 @Composable private fun ErrorCard(text:String){Text("Couldn't load from Audience Verdict API\n$text",Modifier.fillMaxWidth().padding(16.dp).background(Panel,RoundedCornerShape(12.dp)).padding(16.dp),color=Muted)}
 
 @Composable private fun Movies(nav:androidx.navigation.NavHostController){var q by remember{mutableStateOf("")};var filter by remember{mutableStateOf("All")};var movies by remember{mutableStateOf<List<Movie>>(emptyList())};var error by remember{mutableStateOf("")};var busy by remember{mutableStateOf(false)};val context=LocalContext.current
-    LaunchedEffect(q,filter){busy=true;error="";try{movies=AvClient.api.movies(status=when(filter){"Now Showing"->"ACTIVE";"Coming Soon"->"UPCOMING";else->null},title=q.ifBlank{null}).content}catch(t:Throwable){error=apiErrorMessage(t,context)}finally{busy=false}}
-    Column(Modifier.fillMaxSize().background(Ink).padding(horizontal=16.dp)){Row(Modifier.padding(top=14.dp,bottom=12.dp),verticalAlignment=Alignment.CenterVertically){Text("Movies",Modifier.weight(1f),fontSize=24.sp,fontWeight=FontWeight.Bold);Icon(Icons.Default.Search,"Search")}; OutlinedTextField(q,{q=it},Modifier.fillMaxWidth(),placeholder={Text("Search movies, actors, directors…",color=Muted)},singleLine=true,colors=fieldColors(),leadingIcon={Icon(Icons.Default.Search,"Search")}); Row(Modifier.horizontalScroll(rememberScrollState()).padding(vertical=12.dp),horizontalArrangement=Arrangement.spacedBy(8.dp)){listOf("All","Now Showing","Coming Soon","Top Rated").forEach{AssistChip(onClick={filter=it},label={Text(it)},colors=AssistChipDefaults.assistChipColors(containerColor=if(filter==it) Red else Panel, labelColor=Color.White))}}
+    LaunchedEffect(q,filter){if(q.isNotBlank())delay(300);busy=true;error="";try{movies=AvClient.api.movies(status=when(filter){"Now Showing"->"ACTIVE";"Coming Soon"->"UPCOMING";else->null},title=q.ifBlank{null}).content}catch(t:Throwable){error=apiErrorMessage(t,context)}finally{busy=false}}
+    Column(Modifier.fillMaxSize().background(Ink).padding(horizontal=16.dp)){Row(Modifier.padding(top=14.dp,bottom=12.dp),verticalAlignment=Alignment.CenterVertically){Text("Movies",Modifier.weight(1f),fontSize=24.sp,fontWeight=FontWeight.Bold);Icon(Icons.Default.Search,"Search")}; OutlinedTextField(q,{q=it},Modifier.fillMaxWidth(),placeholder={Text("Search movies, actors, directors...",color=Muted)},singleLine=true,colors=fieldColors(),leadingIcon={Icon(Icons.Default.Search,"Search")}); Row(Modifier.horizontalScroll(rememberScrollState()).padding(vertical=12.dp),horizontalArrangement=Arrangement.spacedBy(8.dp)){listOf("All","Now Showing","Coming Soon","Top Rated").forEach{AssistChip(onClick={filter=it},label={Text(it)},colors=AssistChipDefaults.assistChipColors(containerColor=if(filter==it) Red else Panel, labelColor=Color.White))}}
         if(busy) Busy() else if(error.isNotBlank()) ErrorCard(error) else LazyVerticalGridCompat(movies,nav)
     }
 }
@@ -634,15 +680,21 @@ private suspend fun resolvePosterPageImage(link:String):String? = withContext(Di
     var canBookInCity by remember(id){mutableStateOf(false)}
     var cityCheckComplete by remember(id){mutableStateOf(false)}
     var bookingNotice by remember(id){mutableStateOf("")}
+    var showLocationDialog by remember(id){mutableStateOf(false)}
+    var locationEnabled by remember(id){mutableStateOf(false)}
     val context=LocalContext.current
     LaunchedEffect(id) {
         try { movie=AvClient.api.movie(id) } catch(t:Throwable) { error=apiErrorMessage(t,context) }
         try { reviews=AvClient.api.reviews(id) } catch(t:Throwable) { reviewError=apiErrorMessage(t,context) }
     }
-    LaunchedEffect(id) {
+    LaunchedEffect(id,DeviceLocationCache.checked,DeviceLocationCache.city,DeviceLocationCache.enabled) {
+        locationEnabled=DeviceLocationCache.enabled
+        if(!DeviceLocationCache.checked)return@LaunchedEffect
+        cityCheckComplete=false
+        locationEnabled=DeviceLocationCache.enabled
         try {
-            val city=resolveDeviceCity(context)
-            if(city.isNullOrBlank()) bookingNotice="Turn on device location to verify your city before booking."
+            val city=DeviceLocationCache.city
+            if(city.isNullOrBlank()) bookingNotice=if(locationEnabled)"Couldn't determine your live city yet." else "Turn on device location to verify your city before booking."
             else {
                 bookingCity=city
                 val listings=AvClient.api.shows(movieId=id)
@@ -670,7 +722,7 @@ private suspend fun resolvePosterPageImage(link:String):String? = withContext(Di
                     IconButton(onClick={nav.popBackStack()}) { Icon(Icons.Default.ArrowBack,"Back",tint=Color.White) }
                     Spacer(Modifier.weight(1f))
                     IconButton(onClick={saved=!saved}) { Icon(if(saved) Icons.Default.Favorite else Icons.Default.FavoriteBorder,"Watchlist",tint=Red) }
-                    IconButton(onClick={val send=Intent(Intent.ACTION_SEND).apply{type="text/plain";putExtra(Intent.EXTRA_TEXT,"${m.title} — Audience Verdict")};context.startActivity(Intent.createChooser(send,"Share movie"))}) { Icon(Icons.Default.Share,"Share",tint=Color.White) }
+                    IconButton(onClick={val send=Intent(Intent.ACTION_SEND).apply{type="text/plain";putExtra(Intent.EXTRA_TEXT,"${m.title} - Audience Verdict")};context.startActivity(Intent.createChooser(send,"Share movie"))}) { Icon(Icons.Default.Share,"Share",tint=Color.White) }
                 }
                 Column(Modifier.align(Alignment.Center).padding(top=30.dp),horizontalAlignment=Alignment.CenterHorizontally) {
                     IconButton(onClick=playTrailer,modifier=Modifier.size(62.dp).background(Color(0x66000000),CircleShape).border(1.dp,Color.White,CircleShape)) { Icon(Icons.Default.PlayArrow,"Watch trailer",tint=Color.White,modifier=Modifier.size(38.dp)) }
@@ -680,10 +732,12 @@ private suspend fun resolvePosterPageImage(link:String):String? = withContext(Di
                     AssistChip(onClick={},label={Text(when(m.status?.uppercase()){ "ACTIVE"->"NOW SCREENING";"UPCOMING"->"COMING SOON";else->m.releaseStatus?.replace('_',' ')?:"MOVIE"},fontWeight=FontWeight.Bold,fontSize=10.sp)},colors=AssistChipDefaults.assistChipColors(containerColor=Red, labelColor=Color.White))
                     Text(m.title,Modifier.padding(top=4.dp),fontSize=29.sp,fontWeight=FontWeight.Black,lineHeight=34.sp)
                     if(!m.tagline.isNullOrBlank()) Text(m.tagline,Modifier.padding(top=4.dp),fontSize=13.sp,color=Color(0xFFD4D7DA))
-                    Text(listOfNotNull(m.certification,m.language?:m.originalLanguage,(m.durationMinutes?:m.duration)?.let{"${it} min"},m.releaseDate?.take(4)).joinToString("  ·  "),Modifier.padding(top=8.dp),fontSize=12.sp,color=Color(0xFFD0D4D8))
+                    Text(listOfNotNull(m.certification,m.language?:m.originalLanguage,(m.durationMinutes?:m.duration)?.let{"${it} min"},m.releaseDate?.take(4)).joinToString("   -   "),Modifier.padding(top=8.dp),fontSize=12.sp,color=Color(0xFFD0D4D8))
                     Text(if(!cityCheckComplete)"Checking showtimes in your city..." else if(canBookInCity)"Showtimes available in $bookingCity" else bookingNotice,Modifier.padding(top=8.dp),fontSize=10.sp,color=if(canBookInCity)Color(0xFF42D392) else Muted,maxLines=2)
                     Row(Modifier.fillMaxWidth().padding(top=13.dp),horizontalArrangement=Arrangement.spacedBy(10.dp)) {
-                        Button(onClick={nav.navigate("shows/${m.id}")},modifier=Modifier.weight(1f).height(50.dp),enabled=canBookInCity,colors=ButtonDefaults.buttonColors(containerColor=Red,disabledContainerColor=Panel2,disabledContentColor=Muted),shape=RoundedCornerShape(11.dp)) { Text("Book Tickets",fontWeight=FontWeight.Bold);Icon(Icons.Default.ArrowForward,"Book",Modifier.padding(start=6.dp).size(18.dp)) }
+                        Button(onClick={
+                            if(canBookInCity||locationEnabled)nav.navigate("shows/${m.id}") else showLocationDialog=true
+                        },modifier=Modifier.weight(1f).height(50.dp),enabled=cityCheckComplete,colors=ButtonDefaults.buttonColors(containerColor=Red,disabledContainerColor=Panel2,disabledContentColor=Muted),shape=RoundedCornerShape(11.dp)) { Text("Book Tickets",fontWeight=FontWeight.Bold);Icon(Icons.Default.ArrowForward,"Book",Modifier.padding(start=6.dp).size(18.dp)) }
                         OutlinedButton(onClick=playTrailer,modifier=Modifier.height(50.dp),enabled=!trailer.isNullOrBlank(),colors=ButtonDefaults.outlinedButtonColors(contentColor=Color.White),border=ButtonDefaults.outlinedButtonBorder.copy(brush=Brush.linearGradient(listOf(Color(0xFF66717A),Color(0xFF66717A))))) { Icon(Icons.Default.PlayArrow,"Trailer");Text("Trailer",Modifier.padding(start=4.dp)) }
                     }
                 }
@@ -709,6 +763,14 @@ private suspend fun resolvePosterPageImage(link:String):String? = withContext(Di
             Spacer(Modifier.height(24.dp))
         }
     }
+    if(showLocationDialog) AlertDialog(
+        onDismissRequest={showLocationDialog=false},
+        title={Text("Turn on location to book",color=Color.White,fontWeight=FontWeight.Bold)},
+        text={Text("Turn on your phone's location so we can verify shows in your city. Booking will open after location is enabled.",color=Color(0xFFD0D5D9))},
+        confirmButton={TextButton(onClick={showLocationDialog=false;runCatching{context.startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))}}){Text("Turn on location",color=Red)}},
+        dismissButton={TextButton(onClick={showLocationDialog=false}){Text("Not now",color=Color.White)}},
+        containerColor=Panel
+    )
 }
 
 @Composable private fun MovieOverview(movie:Movie) {
@@ -891,12 +953,12 @@ private fun imageReferer(source:String):String = when {
     val average=if(rated.isNotEmpty()) rated.average() else null
     val ratingScale=if((rated.maxOrNull()?:0)>5) 10 else 5
     Column(Modifier.fillMaxWidth().padding(16.dp)) {
-        Row(verticalAlignment=Alignment.CenterVertically) { Column(Modifier.weight(1f)){Text("Audience Reviews",fontSize=18.sp,fontWeight=FontWeight.Bold);Text(movie.title,color=Muted,fontSize=12.sp)};Text("See All  ›",Modifier.clickable{onSeeAll()},color=Red,fontSize=12.sp,fontWeight=FontWeight.SemiBold) }
+        Row(verticalAlignment=Alignment.CenterVertically) { Column(Modifier.weight(1f)){Text("Audience Reviews",fontSize=18.sp,fontWeight=FontWeight.Bold);Text(movie.title,color=Muted,fontSize=12.sp)};Text("See All  >",Modifier.clickable{onSeeAll()},color=Red,fontSize=12.sp,fontWeight=FontWeight.SemiBold) }
         if(error.isNotBlank()) Text("Reviews are temporarily unavailable.",Modifier.padding(top=14.dp),color=Muted,fontSize=12.sp)
         else if(reviews.isEmpty()) Text("No published reviews yet. Be the first to share your verdict.",Modifier.padding(top=18.dp),color=Muted,fontSize=13.sp)
         else {
-            Row(Modifier.fillMaxWidth().padding(vertical=14.dp).background(Panel,RoundedCornerShape(12.dp)).padding(14.dp),verticalAlignment=Alignment.CenterVertically){Text("?",fontSize=30.sp,color=Color(0xFFFFB51B));Text(average?.let{String.format(java.util.Locale.US,"%.1f",it)}?:"—",Modifier.padding(start=7.dp),fontSize=28.sp,fontWeight=FontWeight.Bold);Text(" / $ratingScale\n(${reviews.size} reviews)",Modifier.padding(start=5.dp),fontSize=11.sp,color=Muted)}
-            reviews.take(6).forEach{review->Column(Modifier.fillMaxWidth().padding(vertical=5.dp).background(Panel,RoundedCornerShape(11.dp)).padding(13.dp)){Row(verticalAlignment=Alignment.CenterVertically){Text(review.author?:"Audience member",Modifier.weight(1f),fontSize=13.sp,fontWeight=FontWeight.SemiBold);Text("? ${review.rating?:"—"}",color=Color(0xFFFFB51B),fontSize=12.sp)};if(!review.title.isNullOrBlank())Text(review.title,Modifier.padding(top=7.dp),fontSize=13.sp,fontWeight=FontWeight.Medium);Text(review.text.orEmpty(),Modifier.padding(top=5.dp),color=Color(0xFFC2C8CD),fontSize=12.sp,lineHeight=18.sp,maxLines=5);review.createdAt?.take(10)?.let{Text(displayMovieDate(it),Modifier.padding(top=7.dp),fontSize=10.sp,color=Muted)}}}
+            Row(Modifier.fillMaxWidth().padding(vertical=14.dp).background(Panel,RoundedCornerShape(12.dp)).padding(14.dp),verticalAlignment=Alignment.CenterVertically){Text("?",fontSize=30.sp,color=Color(0xFFFFB51B));Text(average?.let{String.format(java.util.Locale.US,"%.1f",it)}?:"-",Modifier.padding(start=7.dp),fontSize=28.sp,fontWeight=FontWeight.Bold);Text(" / $ratingScale\n(${reviews.size} reviews)",Modifier.padding(start=5.dp),fontSize=11.sp,color=Muted)}
+            reviews.take(6).forEach{review->Column(Modifier.fillMaxWidth().padding(vertical=5.dp).background(Panel,RoundedCornerShape(11.dp)).padding(13.dp)){Row(verticalAlignment=Alignment.CenterVertically){Text(review.author?:"Audience member",Modifier.weight(1f),fontSize=13.sp,fontWeight=FontWeight.SemiBold);Text("? ${review.rating?:"-"}",color=Color(0xFFFFB51B),fontSize=12.sp)};if(!review.title.isNullOrBlank())Text(review.title,Modifier.padding(top=7.dp),fontSize=13.sp,fontWeight=FontWeight.Medium);Text(review.text.orEmpty(),Modifier.padding(top=5.dp),color=Color(0xFFC2C8CD),fontSize=12.sp,lineHeight=18.sp,maxLines=5);review.createdAt?.take(10)?.let{Text(displayMovieDate(it),Modifier.padding(top=7.dp),fontSize=10.sp,color=Muted)}}}
         }
     }
 }
@@ -940,6 +1002,23 @@ private suspend fun resolveDeviceCity(context:Context):String? = withContext(Dis
     @Suppress("DEPRECATION")
     val address=runCatching{android.location.Geocoder(context,java.util.Locale.getDefault()).getFromLocation(location.latitude,location.longitude,1)?.firstOrNull()}.getOrNull()
     address?.locality?.takeIf{it.isNotBlank()}?:address?.subAdminArea?.takeIf{it.isNotBlank()}
+}
+
+private suspend fun refreshDeviceLocationCache(context:Context) {
+    if(DeviceLocationCache.refreshing)return
+    DeviceLocationCache.refreshing=true
+    try {
+        val manager=context.getSystemService(Context.LOCATION_SERVICE) as? android.location.LocationManager
+        val enabled=runCatching {
+            if(android.os.Build.VERSION.SDK_INT>=android.os.Build.VERSION_CODES.P) manager?.isLocationEnabled==true
+            else manager?.isProviderEnabled(android.location.LocationManager.GPS_PROVIDER)==true || manager?.isProviderEnabled(android.location.LocationManager.NETWORK_PROVIDER)==true
+        }.getOrDefault(false)
+        DeviceLocationCache.enabled=enabled
+        DeviceLocationCache.city=if(enabled)runCatching{resolveDeviceCity(context)}.getOrNull() else null
+    } finally {
+        DeviceLocationCache.checked=true
+        DeviceLocationCache.refreshing=false
+    }
 }
 
 private fun theatreMatchesCity(theatre:Theatre?,city:String?):Boolean {
@@ -1024,7 +1103,7 @@ private fun theatreMatchesCity(theatre:Theatre?,city:String?):Boolean {
                 })
             }
             if(playerError.isNotBlank()) Text(playerError,Modifier.fillMaxWidth().background(Color(0xFF321115)).padding(12.dp),color=Color.White,fontSize=12.sp)
-            Text(if(youtubeId!=null) "YouTube player · inside Audience Verdict" else if(drivePreview!=null) "Google Drive player · inside Audience Verdict" else "Opened inside Audience Verdict",Modifier.fillMaxWidth().padding(14.dp),color=Muted,fontSize=12.sp,textAlign=TextAlign.Center)
+            Text(if(youtubeId!=null) "YouTube player  -  inside Audience Verdict" else if(drivePreview!=null) "Google Drive player  -  inside Audience Verdict" else "Opened inside Audience Verdict",Modifier.fillMaxWidth().padding(14.dp),color=Muted,fontSize=12.sp,textAlign=TextAlign.Center)
         }
     }
 }
@@ -1086,9 +1165,9 @@ private fun isDirectVideoUrl(value:String):Boolean = try {
 
 data class SeatStateDto(val id:String="",val label:String="",val rowNumber:Int=0,val columnNumber:Int=0,val category:String="",val color:String?=null,val disabled:Boolean=false,val state:String="AVAILABLE",val clickable:Boolean=true)
 data class ShowLayoutDto(val seats:List<SeatStateDto> = emptyList())
-data class AvailabilityDto(val show:Show?=null,val layout:ShowLayoutDto?=null,val bookedSeatIds:List<String> = emptyList(),val reservedSeatIds:List<String> = emptyList(),val heldSeatIds:List<String> = emptyList(),val availableSeatCount:Int=0)
+data class AvailabilityDto(val show:Show?=null,val layout:ShowLayoutDto?=null,val bookedSeatIds:List<String> = emptyList(),val reservedSeatIds:List<String> = emptyList(),val heldSeatIds:List<String> = emptyList(),val waitlistReservedSeatIds:List<String> = emptyList(),val availableSeatCount:Int=0)
 data class SeatIdsPayload(val showId:String,val seatIds:List<String>)
-data class BookingPayload(val showId:String,val seatIds:List<String>,val termsAccepted:Boolean=true,val alternativeMobile:String?=null)
+data class BookingPayload(val showId:String,val seatIds:List<String>,val termsAccepted:Boolean=true,val alternativeMobile:String?=null,val waitingListEntryId:String?=null)
 data class CancelBookingPayload(val seatIds:List<String>)
 
 private fun parseAvailability(json:com.google.gson.JsonElement):AvailabilityDto {
@@ -1135,11 +1214,6 @@ private fun activeWaitingEntry(entries:List<WaitingListEntry>,showId:String?=nul
     return matching.firstOrNull{it.status.equals("OFFERED",true)} ?: matching.firstOrNull()
 }
 
-private fun waitingOfferExpired(entry:WaitingListEntry,now:java.time.Instant=java.time.Instant.now()):Boolean {
-    val expires=entry.offerExpiresAt?.let{runCatching{java.time.Instant.parse(it)}.getOrNull()} ?: return false
-    return !expires.isAfter(now)
-}
-
 private fun displayTimestamp(value:String?):String? = value?.let { raw ->
     runCatching {
         java.time.OffsetDateTime.parse(raw).format(java.time.format.DateTimeFormatter.ofPattern("dd MMM, h:mm a",java.util.Locale.getDefault()))
@@ -1156,7 +1230,7 @@ private fun makeTicketPdf(context:Context,booking:BookingRecord,seatLabels:List<
     val logoDrawable=context.getDrawable(R.drawable.av_logo)
     if(logoDrawable!=null){val logo=Bitmap.createBitmap(270,100,Bitmap.Config.ARGB_8888);val lc=android.graphics.Canvas(logo);logoDrawable.setBounds(0,0,270,100);logoDrawable.draw(lc);canvas.drawBitmap(logo,null,android.graphics.RectF(35f,34f,260f,117f),paint)}
     paint.color=android.graphics.Color.WHITE;paint.textSize=26f;paint.typeface=android.graphics.Typeface.create("sans-serif",android.graphics.Typeface.BOLD);canvas.drawText("MOVIE TICKET",35f,158f,paint)
-    paint.color=android.graphics.Color.rgb(39,213,128);paint.textSize=15f;canvas.drawText("${booking.status.uppercase()}  ·  AUDIENCE VERDICT",35f,184f,paint)
+    paint.color=android.graphics.Color.rgb(39,213,128);paint.textSize=15f;canvas.drawText("${booking.status.uppercase()}   -   AUDIENCE VERDICT",35f,184f,paint)
     paint.color=android.graphics.Color.rgb(28,34,38);canvas.drawRoundRect(28f,208f,567f,497f,20f,20f,paint)
     if(poster!=null)canvas.drawBitmap(poster,null,android.graphics.RectF(45f,226f,190f,430f),paint)
     paint.color=android.graphics.Color.WHITE;paint.textSize=21f;canvas.drawText((movie?.title?:booking.movie?:"Movie").take(34),212f,250f,paint)
@@ -1171,7 +1245,7 @@ private fun makeTicketPdf(context:Context,booking:BookingRecord,seatLabels:List<
     paint.textSize=12f;paint.typeface=android.graphics.Typeface.create("sans-serif",android.graphics.Typeface.NORMAL);paint.color=android.graphics.Color.LTGRAY
     listOf("Scan the backend issued ticket QR.","Ticket code: ${booking.ticketCode?:"Pending"}","Amount: ${java.text.NumberFormat.getCurrencyInstance(java.util.Locale("en","IN")).format(booking.totalAmount)}","Keep this ticket available at entry.").forEachIndexed{i,line->canvas.drawText(line.take(36),315f,603f+i*25f,paint)}
     paint.color=android.graphics.Color.rgb(255,52,59);canvas.drawRect(28f,812f,567f,815f,paint)
-    paint.color=android.graphics.Color.LTGRAY;paint.textSize=10f;canvas.drawText("Audience Verdict  ·  We show. You decide.",35f,833f,paint)
+    paint.color=android.graphics.Color.LTGRAY;paint.textSize=10f;canvas.drawText("Audience Verdict   -   We show. You decide.",35f,833f,paint)
     document.finishPage(page)
     val output=java.io.ByteArrayOutputStream();document.writeTo(output);document.close();return output.toByteArray()
 }
@@ -1198,12 +1272,12 @@ private fun postNewLocalNotifications(context:Context,items:List<AvNotification>
     if(android.os.Build.VERSION.SDK_INT>=26)manager.createNotificationChannel(android.app.NotificationChannel("av_updates","Audience Verdict updates",android.app.NotificationManager.IMPORTANCE_DEFAULT))
     fresh.reversed().forEach{item->
         val type=item.type.orEmpty().uppercase()
-        val content=item.message?:item.body.orEmpty()
+        val content=notificationDisplayMessage(item)
         val isBooking=type.contains("BOOKING")||type.contains("TICKET")
         val isMovie=type.contains("MOVIE")||content.contains("new movie",true)||content.contains("now open for booking",true)
         val destination=if(isBooking)"bookings" else if(isMovie)"movie" else "notifications"
         val rawTitle=item.movieTitle?:content.ifBlank{item.title.orEmpty()}
-        val cleanedTitle=rawTitle.replace(Regex("(?i)^(a\\s+)?(new movie(?: added)?|movie added|now open for booking)\\s*[:—-]?\\s*"),"").replace(Regex("(?i)\\s+(is now open for booking|is available for booking|added to audience verdict)[.!]*$"),"").trim()
+        val cleanedTitle=rawTitle.replace(Regex("(?i)^(a\\s+)?(new movie(?: added)?|movie added|now open for booking)\\s*[:--]?\\s*"),"").replace(Regex("(?i)\\s+(is now open for booking|is available for booking|added to audience verdict)[.!]*$"),"").trim()
         val tapIntent=Intent(context,MainActivity::class.java).apply {
             flags=Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
             putExtra("av_notification_destination",destination)
@@ -1213,7 +1287,7 @@ private fun postNewLocalNotifications(context:Context,items:List<AvNotification>
         val tapPendingIntent=android.app.PendingIntent.getActivity(context,item.id.hashCode(),tapIntent,android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE)
         val notification=androidx.core.app.NotificationCompat.Builder(context,"av_updates")
             .setSmallIcon(R.drawable.av_notification)
-            .setContentTitle(item.title?:"Audience Verdict update")
+            .setContentTitle(notificationDisplayTitle(item))
             .setContentText(content.ifBlank{"You have a new update."})
             .setStyle(androidx.core.app.NotificationCompat.BigTextStyle().bigText(content))
             .setLargeIcon(android.graphics.BitmapFactory.decodeResource(context.resources,R.drawable.av_logo))
@@ -1222,6 +1296,21 @@ private fun postNewLocalNotifications(context:Context,items:List<AvNotification>
         manager.notify(item.id.hashCode(),notification)
     }
     prefs.edit().putString("latest_id",latest.id).apply()
+}
+
+private fun notificationDisplayTitle(item:AvNotification):String = when(item.type.orEmpty().uppercase()) {
+    "WAITLIST_AVAILABILITY" -> "Seats available for your show"
+    "WAITLIST_AVAILABILITY_EMAIL_PENDING" -> "Waitlist seat alert"
+    else -> item.title?:item.type?.replace('_',' ')?:"Audience Verdict update"
+}
+
+private fun notificationDisplayMessage(item:AvNotification):String {
+    val message=(item.message?:item.body).orEmpty()
+    return when(item.type.orEmpty().uppercase()) {
+        "WAITLIST_AVAILABILITY" -> message.removePrefix("Email sent: ").ifBlank { "Seats are available for a show on your waiting list. Open the show to check the live seat layout." }
+        "WAITLIST_AVAILABILITY_EMAIL_PENDING" -> "Seats are available for a show on your waiting list. Email delivery is being retried; open the app and check the show's live seat layout."
+        else -> message
+    }
 }
 
 @Composable private fun NotificationMovieRoute(nav:androidx.navigation.NavHostController,title:String) {
@@ -1245,7 +1334,6 @@ private fun postNewLocalNotifications(context:Context,items:List<AvNotification>
 
 @Composable private fun ShowList(nav:androidx.navigation.NavHostController,movieId:String) {
     val context=LocalContext.current
-    val lifecycleOwner=LocalLifecycleOwner.current
     val locationScope= rememberCoroutineScope()
     var shows by remember{mutableStateOf<List<Show>>(emptyList())}
     var theatres by remember{mutableStateOf<List<Theatre>>(emptyList())}
@@ -1259,16 +1347,14 @@ private fun postNewLocalNotifications(context:Context,items:List<AvNotification>
     var date by remember{mutableStateOf(java.time.LocalDate.now().toString())}
     val refreshLocation:suspend ()->Unit={
         locationChecked=false
-        val manager=context.getSystemService(Context.LOCATION_SERVICE) as? android.location.LocationManager
-        locationEnabled=runCatching{manager?.isLocationEnabled==true}.getOrDefault(false)
-        userCity=runCatching{resolveDeviceCity(context)}.getOrNull()
+        refreshDeviceLocationCache(context)
+        locationEnabled=DeviceLocationCache.enabled
+        userCity=DeviceLocationCache.city
         locationChecked=true
     }
-    LaunchedEffect(Unit){refreshLocation()}
-    DisposableEffect(lifecycleOwner) {
-        val observer=LifecycleEventObserver{_,event->if(event==Lifecycle.Event.ON_RESUME)locationScope.launch{refreshLocation()}}
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose{lifecycleOwner.lifecycle.removeObserver(observer)}
+    LaunchedEffect(DeviceLocationCache.checked,DeviceLocationCache.city,DeviceLocationCache.enabled){
+        if(DeviceLocationCache.checked){locationEnabled=DeviceLocationCache.enabled;userCity=DeviceLocationCache.city;locationChecked=true}
+        else locationScope.launch{refreshLocation()}
     }
     LaunchedEffect(movieId,date) {
         loading=true;error="";shows=emptyList()
@@ -1301,11 +1387,11 @@ private fun postNewLocalNotifications(context:Context,items:List<AvNotification>
             when {
                 loading -> Busy()
                 error.isNotBlank() -> ErrorCard(error)
-                !locationChecked -> Text("Checking your live city…",Modifier.fillMaxWidth().padding(20.dp),fontSize=13.sp,color=Muted,textAlign=TextAlign.Center)
+                !locationChecked -> Text("Checking your live city...",Modifier.fillMaxWidth().padding(20.dp),fontSize=13.sp,color=Muted,textAlign=TextAlign.Center)
                 shows.isEmpty() -> Text("No available showtimes for this date.",Modifier.padding(16.dp),color=Muted)
                 else -> {
                 Row(Modifier.fillMaxWidth().padding(top=5.dp,bottom=8.dp).background(Panel,RoundedCornerShape(14.dp)).padding(4.dp),horizontalArrangement=Arrangement.spacedBy(5.dp)) {
-                    listOf("LIVE" to "Live city${userCity?.let{" · $it"}.orEmpty()}","OTHER" to "Other cities").forEach{(mode,label)->
+                    listOf("LIVE" to "Live city${userCity?.let{"  -  $it"}.orEmpty()}","OTHER" to "Other cities").forEach{(mode,label)->
                         val selected=cityMode==mode
                         Box(Modifier.weight(1f).background(if(selected)Red else Color.Transparent,RoundedCornerShape(10.dp)).clickable{cityMode=mode;if(mode=="LIVE"&&(userCity.isNullOrBlank()||!locationEnabled))showLocationDialog=true}.padding(horizontal=6.dp,vertical=11.dp),contentAlignment=Alignment.Center){Text(label,fontSize=12.sp,fontWeight=FontWeight.SemiBold,color=if(selected)Color.White else Muted,maxLines=1)}
                     }
@@ -1339,10 +1425,10 @@ private fun postNewLocalNotifications(context:Context,items:List<AvNotification>
                         Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(top=10.dp),horizontalArrangement=Arrangement.spacedBy(9.dp)) {
                             theatreShows.forEach{show->
                                 val price=if(show.ticketType.equals("FREE",true))"FREE" else if(show.ticketPrice>0)java.text.NumberFormat.getCurrencyInstance(java.util.Locale("en","IN")).format(show.ticketPrice) else show.ticketType.ifBlank{"SELECT"}
-                                Column(Modifier.widthIn(min=128.dp).border(1.dp,if(cityMode=="LIVE"&&userCity!=null&&locationEnabled)Red.copy(alpha=.8f) else Muted.copy(alpha=.5f),RoundedCornerShape(14.dp)).background(Color(0x66120A0C),RoundedCornerShape(14.dp)).clickable(enabled=cityMode=="LIVE"&&userCity!=null&&locationEnabled){nav.navigate("seats/${show.id}")}.padding(horizontal=14.dp,vertical=11.dp),horizontalAlignment=Alignment.CenterHorizontally) {
+                                Column(Modifier.widthIn(min=128.dp).border(1.dp,if(cityMode=="LIVE"&&userCity!=null&&locationEnabled)Red.copy(alpha=.8f) else Muted.copy(alpha=.5f),RoundedCornerShape(14.dp)).background(Color(0x66120A0C),RoundedCornerShape(14.dp)).clickable(enabled=cityMode=="LIVE"){if(userCity.isNullOrBlank()||!locationEnabled)showLocationDialog=true else nav.navigate("seats/${show.id}")}.padding(horizontal=14.dp,vertical=11.dp),horizontalAlignment=Alignment.CenterHorizontally) {
                                     Row(verticalAlignment=Alignment.CenterVertically){Icon(Icons.Default.AccessTime,"Showtime",Modifier.size(17.dp),tint=Red);Text(show.startTime,Modifier.padding(start=7.dp),fontSize=16.sp,fontWeight=FontWeight.Bold,color=Color.White)}
                                     Text(price,Modifier.padding(top=5.dp).background(if(price=="FREE")Color(0x3320C77A) else Panel2,RoundedCornerShape(20.dp)).padding(horizontal=11.dp,vertical=4.dp),fontSize=11.sp,fontWeight=FontWeight.Bold,color=if(price=="FREE")Color(0xFF31D27E) else Color(0xFFD8DCE0))
-                                    if(cityMode=="OTHER") Text("Booking unavailable · $theatreCity",Modifier.padding(top=5.dp),fontSize=9.sp,color=Muted,maxLines=1)
+                                    if(cityMode=="OTHER") Text("Booking unavailable  -  $theatreCity",Modifier.padding(top=5.dp),fontSize=9.sp,color=Muted,maxLines=1)
                                     else if(!locationEnabled||userCity.isNullOrBlank()) Text("Turn on location to book",Modifier.padding(top=5.dp),fontSize=9.sp,color=Color(0xFFFFA1A8),maxLines=1)
                                 }
                             }
@@ -1364,7 +1450,8 @@ private fun postNewLocalNotifications(context:Context,items:List<AvNotification>
     )
 }
 
-@Composable private fun SeatInfo(nav:androidx.navigation.NavHostController,showId:String) {
+@Composable private fun SeatInfo(nav:androidx.navigation.NavHostController,showId:String,waitlistEntryId:String="") {
+    val lifecycleOwner=LocalLifecycleOwner.current
     var data by remember{mutableStateOf<AvailabilityDto?>(null)}
     var selected by remember{mutableStateOf(setOf<String>())}
     var msg by remember{mutableStateOf("")}
@@ -1372,11 +1459,33 @@ private fun postNewLocalNotifications(context:Context,items:List<AvNotification>
     var priorShowTickets by remember(showId){mutableIntStateOf(0)}
     var waitingEntries by remember(showId){mutableStateOf<List<WaitingListEntry>>(emptyList())}
     var waitlistSeats by remember(showId){mutableIntStateOf(1)}
+    val activeWaitlistEntry=waitingEntries.firstOrNull{it.showId==showId&&it.status.uppercase() in setOf("WAITING","OFFERED")}
+    val effectiveWaitlistEntryId=waitlistEntryId.ifBlank{activeWaitlistEntry?.id.orEmpty()}
     val scope= rememberCoroutineScope()
     LaunchedEffect(showId) { try{val availability=parseAvailability(AvClient.api.availability(showId));data=if(availability.show==null)availability.copy(show=AvClient.api.show(showId)) else availability}catch(t:Throwable){msg=apiErrorMessage(t)} }
     LaunchedEffect(showId) { try { priorShowTickets=AvClient.api.bookings().filter{it.showId==showId&&it.status.uppercase() !in setOf("CANCELLED","EXPIRED","REJECTED")}.sumOf{it.ticketCount} } catch(_:Throwable) { } }
     LaunchedEffect(showId) { try { waitingEntries=AvClient.api.waitingList().filter{it.showId==showId} } catch(_:Throwable) { } }
-    LaunchedEffect(showId) { while(isActive) { delay(5000); try { data=parseAvailability(AvClient.api.availability(showId)) } catch(_:Throwable) { };try{waitingEntries=AvClient.api.waitingList().filter{it.showId==showId}}catch(_:Throwable){} } }
+    LaunchedEffect(showId,lifecycleOwner) {
+        var availabilityInterval=10_000L
+        var waitlistInterval=10_000L
+        var nextWaitlistAt=SystemClock.elapsedRealtime()+waitlistInterval
+        while(isActive) {
+            delay(availabilityInterval)
+            if(!lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) continue
+            try {
+                data=parseAvailability(AvClient.api.availability(showId))
+                availabilityInterval=if(waitingEntries.any{it.status.uppercase() in setOf("WAITING","OFFERED")})5_000L else 10_000L
+            } catch(_:Throwable) { availabilityInterval=(availabilityInterval*2).coerceAtMost(60_000L) }
+            val now=SystemClock.elapsedRealtime()
+            if(now>=nextWaitlistAt) {
+                try {
+                    waitingEntries=AvClient.api.waitingList().filter{it.showId==showId}
+                    waitlistInterval=if(waitingEntries.any{it.status.uppercase() in setOf("WAITING","OFFERED")})5_000L else 10_000L
+                } catch(_:Throwable) { waitlistInterval=(waitlistInterval*2).coerceAtMost(120_000L) }
+                nextWaitlistAt=SystemClock.elapsedRealtime()+waitlistInterval
+            }
+        }
+    }
     Box(Modifier.fillMaxSize()) {
         Image(painterResource(R.drawable.seat_cinema_bg),"",Modifier.fillMaxSize(),contentScale=ContentScale.Crop)
         Box(Modifier.fillMaxSize().background(Color(0xB9080A0B)))
@@ -1394,7 +1503,7 @@ private fun postNewLocalNotifications(context:Context,items:List<AvNotification>
                 val availableSeats=seats.count{seat->!seat.disabled&&seat.clickable&&seat.state.uppercase() !in listOf("BOOKED","HELD","RESERVED","UNAVAILABLE")&&seat.id !in d.bookedSeatIds&&seat.id !in d.heldSeatIds&&seat.id !in d.reservedSeatIds}
                 val ticketLimit=d.show?.maxTicketsPerMobile?.takeIf{it>0}
                 val remainingTickets=ticketLimit?.let{(it-priorShowTickets).coerceAtLeast(0)}
-                val selectionLimit=remainingTickets?:ticketLimit?:Int.MAX_VALUE
+                val selectionLimit=if(effectiveWaitlistEntryId.isNotBlank())minOf(waitingEntries.firstOrNull{it.id==effectiveWaitlistEntryId}?.requestedSeatsCount?:activeWaitlistEntry?.requestedSeatsCount?:ticketLimit?:Int.MAX_VALUE,remainingTickets?:Int.MAX_VALUE) else remainingTickets?:ticketLimit?:Int.MAX_VALUE
                 LaunchedEffect(remainingTickets,seats.size){val maxRequest=(remainingTickets?:seats.size).coerceIn(0,seats.size);waitlistSeats=if(maxRequest>0)waitlistSeats.coerceIn(1,maxRequest) else 1}
                 Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()),horizontalAlignment=Alignment.CenterHorizontally) {
                     if(seats.isEmpty()) Text("Seat layout has not been published for this show yet.",Modifier.padding(26.dp),color=Color(0xFFD0D5D9),textAlign=TextAlign.Center)
@@ -1437,13 +1546,13 @@ private fun postNewLocalNotifications(context:Context,items:List<AvNotification>
                     }
                     Column(Modifier.padding(start=12.dp),horizontalAlignment=Alignment.End) {
                         Text("Total Amount",fontSize=11.sp,color=Muted)
-                        Text(if(total==null)"—" else java.text.NumberFormat.getCurrencyInstance(java.util.Locale("en","IN")).format(total),Modifier.padding(top=4.dp),fontSize=19.sp,fontWeight=FontWeight.Bold,color=Color.White)
+                        Text(if(total==null)"-" else java.text.NumberFormat.getCurrencyInstance(java.util.Locale("en","IN")).format(total),Modifier.padding(top=4.dp),fontSize=19.sp,fontWeight=FontWeight.Bold,color=Color.White)
                     }
                 }
-                if(ticketLimit!=null) Text("Limit: $ticketLimit tickets per mobile for this show · ${remainingTickets?:ticketLimit} remaining",Modifier.fillMaxWidth().padding(top=5.dp),fontSize=10.sp,color=if(remainingTickets==0)Red else Muted,textAlign=TextAlign.Center)
+                if(ticketLimit!=null) Text("Limit: $ticketLimit tickets per mobile for this show  -  ${remainingTickets?:ticketLimit} remaining",Modifier.fillMaxWidth().padding(top=5.dp),fontSize=10.sp,color=if(remainingTickets==0)Red else Muted,textAlign=TextAlign.Center)
                 if(msg.isNotBlank()) Text(msg,Modifier.fillMaxWidth().padding(top=6.dp),color=Red,fontSize=11.sp,maxLines=2)
-                Button(onClick={scope.launch{busy=true;msg="";try{val held=AvClient.api.hold(SeatIdsPayload(showId,selected.toList()));val expires=seatHoldExpiry(held);nav.navigate("terms/${Uri.encode(showId)}?seats=${Uri.encode(selected.joinToString(","))}&expires=${Uri.encode(expires)}")}catch(t:Throwable){msg=apiErrorMessage(t);try{data=parseAvailability(AvClient.api.availability(showId))}catch(_:Throwable){}}finally{busy=false}}},Modifier.fillMaxWidth().padding(top=10.dp,bottom=12.dp).height(54.dp),enabled=selected.isNotEmpty()&&selected.size<=selectionLimit&&!busy,colors=ButtonDefaults.buttonColors(containerColor=Red,disabledContainerColor=Color(0xFF67262B)),shape=RoundedCornerShape(28.dp)) {
-                    Text(if(busy)"Holding seats…" else "Continue · ${selected.size} seats     >",fontSize=16.sp,fontWeight=FontWeight.Bold,color=Color.White)
+                Button(onClick={scope.launch{busy=true;msg="";try{val held=AvClient.api.hold(SeatIdsPayload(showId,selected.toList()));val expires=seatHoldExpiry(held);nav.navigate("terms/${Uri.encode(showId)}?seats=${Uri.encode(selected.joinToString(","))}&expires=${Uri.encode(expires)}&waitlistEntryId=${Uri.encode(effectiveWaitlistEntryId)}")}catch(t:Throwable){msg=apiErrorMessage(t);try{data=parseAvailability(AvClient.api.availability(showId))}catch(_:Throwable){}}finally{busy=false}}},Modifier.fillMaxWidth().padding(top=10.dp,bottom=12.dp).height(54.dp),enabled=selected.isNotEmpty()&&selected.size<=selectionLimit&&!busy,colors=ButtonDefaults.buttonColors(containerColor=Red,disabledContainerColor=Color(0xFF67262B)),shape=RoundedCornerShape(28.dp)) {
+                    Text(if(busy)"Holding seats..." else "Continue  -  ${selected.size} seats     >",fontSize=16.sp,fontWeight=FontWeight.Bold,color=Color.White)
                 }
                 if(availableSeats==0&&seats.isNotEmpty()) {
                     val currentEntry=activeWaitingEntry(waitingEntries,showId)
@@ -1455,7 +1564,7 @@ private fun postNewLocalNotifications(context:Context,items:List<AvNotification>
                             Row(Modifier.fillMaxWidth().padding(top=9.dp,bottom=6.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.Center) {
                                 Text("Tickets requested",fontSize=12.sp,color=Muted)
                                 Spacer(Modifier.width(15.dp))
-                                OutlinedButton(onClick={waitlistSeats=(waitlistSeats-1).coerceAtLeast(1)},enabled=waitlistSeats>1,contentPadding=PaddingValues(horizontal=13.dp,vertical=3.dp)){Text("−",fontSize=18.sp,color=Color.White)}
+                                OutlinedButton(onClick={waitlistSeats=(waitlistSeats-1).coerceAtLeast(1)},enabled=waitlistSeats>1,contentPadding=PaddingValues(horizontal=13.dp,vertical=3.dp)){Text("-",fontSize=18.sp,color=Color.White)}
                                 Text("$waitlistSeats",Modifier.padding(horizontal=13.dp),fontSize=15.sp,fontWeight=FontWeight.Bold,color=Color.White)
                                 OutlinedButton(onClick={waitlistSeats=(waitlistSeats+1).coerceAtMost(waitlistLimit)},enabled=waitlistSeats<waitlistLimit,contentPadding=PaddingValues(horizontal=13.dp,vertical=3.dp)){Text("+",fontSize=18.sp,color=Color.White)}
                             }
@@ -1464,30 +1573,14 @@ private fun postNewLocalNotifications(context:Context,items:List<AvNotification>
                                 try {
                                     val entry=AvClient.api.joinWaitingList(WaitingListRequest(showId,waitlistSeats))
                                     waitingEntries=listOf(entry)+waitingEntries.filterNot{it.id==entry.id}
-                                    msg=if(entry.status.equals("OFFERED",true)) "Seats are available for you to claim now." else "You're on the waiting list${entry.position?.let{" at position $it"}.orEmpty()}."
+                                    msg="Added to the waiting list! We'll email you when seats become available."
                                 } catch(t:Throwable) { msg=apiErrorMessage(t) }
                                 finally { busy=false }
-                            }},Modifier.fillMaxWidth().padding(bottom=12.dp),enabled=!busy,border=BorderStroke(1.dp,Red),colors=ButtonDefaults.outlinedButtonColors(contentColor=Color.White)) { Text(if(busy)"Joining waiting list…" else "Join Waiting List",fontWeight=FontWeight.Bold) }
+                            }},Modifier.fillMaxWidth().padding(bottom=12.dp),enabled=!busy,border=BorderStroke(1.dp,Red),colors=ButtonDefaults.outlinedButtonColors(contentColor=Color.White)) { Text(if(busy)"Joining waiting list..." else "Join Waiting List",fontWeight=FontWeight.Bold) }
                         }
                     } else {
-                        val offered=currentEntry.status.equals("OFFERED",true)
-                        val expired=offered&&waitingOfferExpired(currentEntry)
-                        Text(buildString {
-                            append(if(offered) "Seats offered" else "Waiting")
-                            currentEntry.position?.let{append(" · position $it")}
-                            append(" · ${currentEntry.requestedSeatsCount} ticket${if(currentEntry.requestedSeatsCount==1)"" else "s"}")
-                        },Modifier.fillMaxWidth().padding(top=8.dp,bottom=4.dp),fontSize=12.sp,color=if(offered&&!expired)Color(0xFF50D897) else Muted,textAlign=TextAlign.Center)
-                        if(offered&&currentEntry.offerExpiresAt!=null) Text("Offer expires ${displayTimestamp(currentEntry.offerExpiresAt)}",Modifier.fillMaxWidth().padding(bottom=6.dp),fontSize=11.sp,color=if(expired)Red else Muted,textAlign=TextAlign.Center)
-                        if(offered&&!expired) Button(onClick={scope.launch{
-                            busy=true;msg=""
-                            try {
-                                val claimed=AvClient.api.claimWaitingList(currentEntry.id)
-                                waitingEntries=AvClient.api.waitingList().filter{it.showId==showId}
-                                if(claimed.status.equals("CONVERTED",true)) nav.navigate("bookings") { launchSingleTop=true }
-                                else msg="Your offer is ${claimed.status.lowercase()}. Refresh shortly for the latest status."
-                            } catch(t:Throwable) { msg=apiErrorMessage(t) }
-                            finally { busy=false }
-                        }},Modifier.fillMaxWidth().padding(bottom=6.dp),enabled=!busy,colors=ButtonDefaults.buttonColors(containerColor=Red)) { Text(if(busy)"Claiming offer…" else "Claim ${currentEntry.requestedSeatsCount} seat${if(currentEntry.requestedSeatsCount==1)"" else "s"}",color=Color.White) }
+                        Text(if(currentEntry.status.equals("CANCELLED",true)) "Request cancelled" else "You're on the waiting list!",Modifier.fillMaxWidth().padding(top=12.dp,bottom=4.dp),fontSize=21.sp,fontWeight=FontWeight.Bold,color=Color.White,textAlign=TextAlign.Center)
+                        Text("We'll email you when seats become available. All available seats are open to everyone and can be booked through the normal seat layout.",Modifier.fillMaxWidth().padding(bottom=8.dp),fontSize=13.sp,lineHeight=18.sp,color=Muted,textAlign=TextAlign.Center)
                         OutlinedButton(onClick={scope.launch{
                             busy=true
                             try { AvClient.api.cancelWaitingList(currentEntry.id);waitingEntries=waitingEntries.filterNot{it.id==currentEntry.id};msg="Waiting-list request cancelled." }
@@ -1507,10 +1600,12 @@ private fun postNewLocalNotifications(context:Context,items:List<AvNotification>
         Text(label,Modifier.padding(start=5.dp),fontSize=10.sp,color=Color(0xFFD0D5D9))
     }
 }
-@Composable private fun BookingTermsScreen(nav:androidx.navigation.NavHostController,showId:String,seatCsv:String,holdExpiry:String) {
+@Composable private fun BookingTermsScreen(nav:androidx.navigation.NavHostController,showId:String,seatCsv:String,holdExpiry:String,waitlistEntryId:String="") {
     val seatIds=remember(showId,seatCsv){seatCsv.split(',').map{it.trim()}.filter{it.isNotBlank()}.distinct()}
     var currentIndex by remember(showId,seatCsv){mutableIntStateOf(0)}
     var accepted by remember(showId,seatCsv){mutableStateOf(setOf<Int>())}
+    var typedConditionIndexes by remember(showId,seatCsv){mutableStateOf(setOf<Int>())}
+    var typedConditionText by remember(showId,seatCsv){mutableStateOf("")}
     var availability by remember(showId){mutableStateOf<AvailabilityDto?>(null)}
     var show by remember(showId){mutableStateOf<Show?>(null)}
     var movie by remember(showId){mutableStateOf<Movie?>(null)}
@@ -1550,7 +1645,7 @@ private fun postNewLocalNotifications(context:Context,items:List<AvNotification>
     LaunchedEffect(showId,refreshAvailability) {
         if(refreshAvailability>0) try { availability=parseAvailability(AvClient.api.availability(showId)) } catch(_:Throwable) { }
     }
-    LaunchedEffect(showId,seatCsv,holdExpiry) {
+    LaunchedEffect(showId,seatCsv,holdExpiry,waitlistEntryId) {
         if(holdExpiry.isBlank()) return@LaunchedEffect
         while(isActive) {
             secondsLeft=holdExpirySeconds(holdExpiry)
@@ -1587,7 +1682,7 @@ private fun postNewLocalNotifications(context:Context,items:List<AvNotification>
             Text("Terms & Conditions",Modifier.padding(top=3.dp),fontSize=27.sp,fontWeight=FontWeight.Black,color=Color.White)
             Text("Please review and agree to each condition for a smooth movie experience.",Modifier.padding(top=4.dp),fontSize=12.sp,lineHeight=17.sp,color=Color(0xFFCDD2D7))
             BookingProgress()
-            if(holdExpiry.isNotBlank()) Text(if(holdExpired)"Seat hold expired. Return to seat selection to check availability again." else "Seats reserved for ${secondsLeft/60}:${(secondsLeft%60).toString().padStart(2,'0')}",Modifier.fillMaxWidth().padding(top=3.dp),fontSize=11.sp,color=if(holdExpired)Red else Color(0xFF55D993),textAlign=TextAlign.Center)
+            if(holdExpiry.isNotBlank()) Text(if(holdExpired)"Booking seat hold expired. Return to seat selection to reserve again." else "Booking seat hold time left  ${secondsLeft/60}:${(secondsLeft%60).toString().padStart(2,'0')}",Modifier.fillMaxWidth().padding(top=3.dp),fontSize=11.sp,color=if(holdExpired)Red else Color(0xFF55D993),textAlign=TextAlign.Center)
 
             Column(Modifier.fillMaxWidth().padding(top=8.dp).border(1.dp,Color(0xFF2B3238),RoundedCornerShape(16.dp)).background(Color(0xD9080B0D),RoundedCornerShape(16.dp)).padding(12.dp)) {
                 Row(verticalAlignment=Alignment.CenterVertically) {
@@ -1604,14 +1699,14 @@ private fun postNewLocalNotifications(context:Context,items:List<AvNotification>
                         else Box(Modifier.width(66.dp).height(92.dp).background(Panel2,RoundedCornerShape(8.dp)),contentAlignment=Alignment.Center){Icon(Icons.Default.Movie,"Movie poster",tint=Muted)}
                         Column(Modifier.weight(1f).padding(start=10.dp)) {
                             Text(movie?.title?:"Movie",fontSize=14.sp,fontWeight=FontWeight.Bold,color=Color.White,maxLines=2)
-                            Text(listOfNotNull(movie?.language?:movie?.originalLanguage,(movie?.durationMinutes?:movie?.duration)?.let{"${it/60}h ${it%60}m"}).joinToString("  ·  ").ifBlank{"Movie details"},Modifier.padding(top=5.dp),fontSize=11.sp,color=Color(0xFFC5CBD0))
+                            Text(listOfNotNull(movie?.language?:movie?.originalLanguage,(movie?.durationMinutes?:movie?.duration)?.let{"${it/60}h ${it%60}m"}).joinToString("   -   ").ifBlank{"Movie details"},Modifier.padding(top=5.dp),fontSize=11.sp,color=Color(0xFFC5CBD0))
                             Text(theatre?.name?:"Cinema",Modifier.padding(top=8.dp),fontSize=12.sp,fontWeight=FontWeight.SemiBold,color=Color.White,maxLines=1)
                             Text(listOfNotNull(theatre?.address,theatre?.city).joinToString(", "),Modifier.padding(top=2.dp),fontSize=10.sp,color=Muted,maxLines=2,lineHeight=14.sp)
                         }
                     }
                     HorizontalDivider(Modifier.padding(vertical=9.dp),color=Color(0xFF293137))
                     Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(6.dp)) {
-                        BookingDetail("DATE & TIME",listOfNotNull(show?.date?.let(::displayMovieDate),show?.startTime).joinToString(" · ").ifBlank{"—"},Modifier.weight(1f))
+                        BookingDetail("DATE & TIME",listOfNotNull(show?.date?.let(::displayMovieDate),show?.startTime).joinToString("  -  ").ifBlank{"-"},Modifier.weight(1f))
                         BookingDetail("SEATS",selectedLabels.joinToString(", ").ifBlank{"${seatIds.size} selected"},Modifier.weight(1f))
                         BookingDetail("TOTAL",java.text.NumberFormat.getCurrencyInstance(java.util.Locale("en","IN")).format(totalAmount),Modifier.weight(1f))
                     }
@@ -1623,6 +1718,26 @@ private fun postNewLocalNotifications(context:Context,items:List<AvNotification>
             if(createdBooking==null) {
                 val condition=BookingConditions[currentIndex]
                 val conditionText=if(currentIndex==2) "No cancellation or refund policy for this show was supplied by the cinema. Please contact the venue to confirm the applicable terms before booking." else condition.description
+                LaunchedEffect(currentIndex,conditionText) {
+                    if(currentIndex in typedConditionIndexes) {
+                        typedConditionText=conditionText
+                    } else {
+                        typedConditionText=""
+                        conditionText.forEachIndexed { index, _ ->
+                            typedConditionText=conditionText.substring(0,index+1)
+                            delay(18)
+                        }
+                        typedConditionIndexes=typedConditionIndexes+currentIndex
+                    }
+                }
+                val conditionFullyTyped=currentIndex in typedConditionIndexes
+                val setCurrentConditionAccepted:(Boolean)->Unit={checked->
+                    val acceptedIndex=currentIndex
+                    if(conditionFullyTyped) {
+                        accepted=if(checked)accepted+acceptedIndex else accepted-acceptedIndex
+                        if(checked&&acceptedIndex<BookingConditions.lastIndex)currentIndex=acceptedIndex+1
+                    }
+                }
                 Column(Modifier.fillMaxWidth().padding(top=12.dp).border(1.5.dp,Red,RoundedCornerShape(20.dp)).background(Color(0xE9090B0D),RoundedCornerShape(20.dp)).pointerInput(currentIndex){
                     var drag=0f
                     detectHorizontalDragGestures(onHorizontalDrag={change,amount->drag+=amount;change.consume()},onDragEnd={if(drag < -55f)currentIndex=(currentIndex+1).coerceAtMost(BookingConditions.lastIndex) else if(drag>55f)currentIndex=(currentIndex-1).coerceAtLeast(0);drag=0f})
@@ -1633,10 +1748,11 @@ private fun postNewLocalNotifications(context:Context,items:List<AvNotification>
                         Text("%02d / %02d".format(currentIndex+1,BookingConditions.size),Modifier.align(Alignment.TopStart).padding(10.dp).background(Red,RoundedCornerShape(50.dp)).padding(horizontal=12.dp,vertical=8.dp),fontSize=12.sp,fontWeight=FontWeight.Bold,color=Color.White)
                     }
                     Text(condition.title,Modifier.padding(start=3.dp,end=3.dp,top=12.dp),fontSize=20.sp,fontWeight=FontWeight.Bold,color=Color.White)
-                    Text(conditionText,Modifier.padding(horizontal=3.dp,vertical=7.dp),fontSize=12.sp,lineHeight=17.sp,color=Color(0xFFD1D6DB))
-                    Row(Modifier.fillMaxWidth().clickable{accepted=if(currentIndex in accepted)accepted-currentIndex else accepted+currentIndex}.padding(vertical=7.dp),verticalAlignment=Alignment.CenterVertically) {
-                        Checkbox(checked=currentIndex in accepted,onCheckedChange={checked->accepted=if(checked)accepted+currentIndex else accepted-currentIndex},colors=CheckboxDefaults.colors(checkedColor=Red,uncheckedColor=Color(0xFFB6BEC5),checkmarkColor=Color.White))
-                        Text("I agree to this condition.",Modifier.padding(start=4.dp),fontSize=13.sp,color=Color.White)
+                    Text(typedConditionText,Modifier.padding(horizontal=3.dp,vertical=7.dp),fontSize=12.sp,lineHeight=17.sp,color=Color(0xFFD1D6DB))
+                    if(!conditionFullyTyped) LinearProgressIndicator(progress={if(conditionText.isBlank())1f else typedConditionText.length.toFloat()/conditionText.length.toFloat()},Modifier.fillMaxWidth().padding(horizontal=3.dp),color=Red,trackColor=Color(0xFF30363B))
+                    Row(Modifier.fillMaxWidth().clickable(enabled=conditionFullyTyped){setCurrentConditionAccepted(currentIndex !in accepted)}.padding(vertical=7.dp),verticalAlignment=Alignment.CenterVertically) {
+                        Checkbox(checked=currentIndex in accepted,onCheckedChange=setCurrentConditionAccepted,enabled=conditionFullyTyped,colors=CheckboxDefaults.colors(checkedColor=Red,uncheckedColor=Color(0xFFB6BEC5),checkmarkColor=Color.White,disabledUncheckedColor=Color(0xFF656B70)))
+                        Text(if(conditionFullyTyped)"I agree to this condition." else "Please read the full condition…",Modifier.padding(start=4.dp),fontSize=13.sp,color=if(conditionFullyTyped)Color.White else Muted)
                     }
                 }
                 Row(Modifier.fillMaxWidth().padding(top=8.dp),horizontalArrangement=Arrangement.SpaceBetween,verticalAlignment=Alignment.CenterVertically) {
@@ -1652,11 +1768,17 @@ private fun postNewLocalNotifications(context:Context,items:List<AvNotification>
                 val confirmBrush=if(canConfirm)Brush.horizontalGradient(listOf(Color(0xFFFF555B),Color(0xFFFF202A),Color(0xFFE91F29))) else Brush.horizontalGradient(listOf(Color(0xFF542528),Color(0xFF3D2426)))
                 Box(Modifier.fillMaxWidth().padding(top=6.dp,bottom=12.dp).height(54.dp).clip(RoundedCornerShape(16.dp)).background(confirmBrush)) {
                     Button(onClick={
-                        if(!allAccepted||!bookingReady||isSubmitting)return@Button
+                        if(!allAccepted||!bookingReady||isSubmitting||holdExpired)return@Button
                         scope.launch {
                             isSubmitting=true;submitError=""
                             try {
-                                val response=AvClient.api.createBooking(BookingPayload(showId,seatIds,termsAccepted=true,alternativeMobile=alternativeMobile.trim().ifBlank{null}))
+                                val bookingPayload=BookingPayload(showId,seatIds,termsAccepted=true,alternativeMobile=alternativeMobile.trim().ifBlank{null},waitingListEntryId=waitlistEntryId.takeIf{it.isNotBlank()})
+                                val response=try { AvClient.api.createBooking(bookingPayload) } catch(http:HttpException) {
+                                    val raw=runCatching{http.response()?.errorBody()?.string().orEmpty()}.getOrDefault("")
+                                    val normalized=raw.lowercase()
+                                    val oldApiRejectsLink=!bookingPayload.waitingListEntryId.isNullOrBlank()&&normalized.contains("waitinglistentryid")&&listOf("unsupported","unknown field","unrecognized","not allowed","not accepted","unexpected field").any{normalized.contains(it)}
+                                    if(oldApiRejectsLink) AvClient.api.createBooking(bookingPayload.copy(waitingListEntryId=null)) else throw http
+                                }
                                 if(!response.has("id")||response.get("id").isJsonNull||response.get("id").asString.isBlank()) throw IllegalStateException("The server did not return a booking confirmation.")
                                 val booking=com.google.gson.Gson().fromJson(response,BookingRecord::class.java)
                                 createdBooking=booking
@@ -1775,7 +1897,7 @@ private fun postNewLocalNotifications(context:Context,items:List<AvNotification>
     )
 }
 
-@Composable private fun BookingCard(booking:BookingRecord,onOpen:()->Unit,onCancel:()->Unit) {
+@Composable private fun BookingCard(booking:BookingRecord,onOpen:()->Unit,onCancel:()->Unit,showCancelAction:Boolean=true) {
     var seatLabels by remember(booking.id){mutableStateOf<List<String>?>(null)}
     LaunchedEffect(booking.showId,booking.seatIds) {
         seatLabels=try { loadSeatLabels(booking.showId,booking.seatIds) } catch(_:Throwable) { emptyList() }
@@ -1801,9 +1923,9 @@ private fun postNewLocalNotifications(context:Context,items:List<AvNotification>
             Text(amount,fontSize=16.sp,fontWeight=FontWeight.Bold,color=Color.White)
         }
         if(!booking.ticketCode.isNullOrBlank()) Text("Ticket code  ${booking.ticketCode}",Modifier.fillMaxWidth().padding(top=12.dp).background(Panel2,RoundedCornerShape(8.dp)).padding(10.dp),fontSize=12.sp,color=Color(0xFFD1D5D8))
-        Text("View ticket  ?",Modifier.align(Alignment.End).padding(top=8.dp),fontSize=12.sp,fontWeight=FontWeight.SemiBold,color=Red)
+        Text("View details  >",Modifier.align(Alignment.End).padding(top=8.dp),fontSize=12.sp,fontWeight=FontWeight.SemiBold,color=Red)
         if(booking.status.equals("CANCELLED",true)&&!booking.cancellationReason.isNullOrBlank()) Text(booking.cancellationReason,Modifier.padding(top=8.dp),fontSize=12.sp,color=Red)
-        if(booking.status.uppercase() !in setOf("CANCELLED","EXPIRED","REJECTED")&&!booking.attended) OutlinedButton(onClick=onCancel,Modifier.fillMaxWidth().padding(top=8.dp),border=androidx.compose.foundation.BorderStroke(1.dp,Red),colors=ButtonDefaults.outlinedButtonColors(contentColor=Red),shape=RoundedCornerShape(10.dp)){Text("Cancel ticket",fontWeight=FontWeight.SemiBold)}
+        if(showCancelAction&&booking.status.uppercase() !in setOf("CANCELLED","EXPIRED","REJECTED")&&!booking.attended) OutlinedButton(onClick=onCancel,Modifier.fillMaxWidth().padding(top=8.dp),border=androidx.compose.foundation.BorderStroke(1.dp,Red),colors=ButtonDefaults.outlinedButtonColors(contentColor=Red),shape=RoundedCornerShape(10.dp)){Text("Cancel ticket",fontWeight=FontWeight.SemiBold)}
     }
 }
 
@@ -1855,9 +1977,9 @@ private fun postNewLocalNotifications(context:Context,items:List<AvNotification>
             Column(Modifier.fillMaxWidth().padding(top=12.dp).border(1.dp,Color(0xFF30383D),RoundedCornerShape(16.dp)).background(Panel,RoundedCornerShape(16.dp)).padding(14.dp)) {
                 Text(current.movie?:"Movie",fontSize=19.sp,fontWeight=FontWeight.Bold,color=Color.White)
                 Text(current.theatre?:"Cinema",Modifier.padding(top=6.dp),fontSize=14.sp,fontWeight=FontWeight.SemiBold,color=Color(0xFFD5D9DD))
-                Text(listOfNotNull(current.screen,current.date?.let(::displayMovieDate),current.time).joinToString("  ·  "),Modifier.padding(top=3.dp),fontSize=12.sp,color=Muted)
+                Text(listOfNotNull(current.screen,current.date?.let(::displayMovieDate),current.time).joinToString("   -   "),Modifier.padding(top=3.dp),fontSize=12.sp,color=Muted)
                 HorizontalDivider(Modifier.padding(vertical=12.dp),color=Color(0xFF30383D))
-                TicketInfoRow("Seats", "${current.seatIds.size} ticket${if(current.seatIds.size==1)"" else "s"}  ·  ${seatLabels.joinToString(", ").ifBlank{"Seat labels unavailable"}}")
+                TicketInfoRow("Seats", "${current.seatIds.size} ticket${if(current.seatIds.size==1)"" else "s"}   -   ${seatLabels.joinToString(", ").ifBlank{"Seat labels unavailable"}}")
                 TicketInfoRow("Total",java.text.NumberFormat.getCurrencyInstance(java.util.Locale("en","IN")).format(current.totalAmount))
                 TicketInfoRow("Booking reference",current.id)
             }
@@ -1898,7 +2020,7 @@ private fun postNewLocalNotifications(context:Context,items:List<AvNotification>
     }
 }
 
-@Composable private fun ReviewPage(movieId:String,nav:androidx.navigation.NavHostController){var reviews by remember{mutableStateOf<List<Review>>(emptyList())};var error by remember{mutableStateOf("")};LaunchedEffect(movieId){try{reviews=AvClient.api.reviews(movieId)}catch(t:Throwable){error=t.message?:"Unable to load reviews"}};Column(Modifier.fillMaxSize().background(Ink)){PageHeader("Audience Reviews"){nav.popBackStack()};Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal=18.dp)){if(error.isNotBlank())ErrorCard(error);if(reviews.isEmpty()&&error.isBlank())Text("No published reviews yet.",color=Color(0xFFD0D5D9),modifier=Modifier.padding(18.dp));reviews.forEach{r->Column(Modifier.fillMaxWidth().padding(vertical=6.dp).background(Panel,RoundedCornerShape(12.dp)).padding(14.dp)){Text(r.title?:"Review",fontWeight=FontWeight.Bold,color=Color.White);Text("${r.author?:"Audience member"} · ${r.rating?:"—"}",color=Color(0xFFFFB51B),fontSize=12.sp);Text(r.text.orEmpty(),color=Color(0xFFD0D5D9),modifier=Modifier.padding(top=6.dp));Text(r.status?:"",color=Muted,fontSize=10.sp)}}}}}
+@Composable private fun ReviewPage(movieId:String,nav:androidx.navigation.NavHostController){var reviews by remember{mutableStateOf<List<Review>>(emptyList())};var error by remember{mutableStateOf("")};LaunchedEffect(movieId){try{reviews=AvClient.api.reviews(movieId)}catch(t:Throwable){error=t.message?:"Unable to load reviews"}};Column(Modifier.fillMaxSize().background(Ink)){PageHeader("Audience Reviews"){nav.popBackStack()};Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal=18.dp)){if(error.isNotBlank())ErrorCard(error);if(reviews.isEmpty()&&error.isBlank())Text("No published reviews yet.",color=Color(0xFFD0D5D9),modifier=Modifier.padding(18.dp));reviews.forEach{r->Column(Modifier.fillMaxWidth().padding(vertical=6.dp).background(Panel,RoundedCornerShape(12.dp)).padding(14.dp)){Text(r.title?:"Review",fontWeight=FontWeight.Bold,color=Color.White);Text("${r.author?:"Audience member"}  -  ${r.rating?:"-"}",color=Color(0xFFFFB51B),fontSize=12.sp);Text(r.text.orEmpty(),color=Color(0xFFD0D5D9),modifier=Modifier.padding(top=6.dp));Text(r.status?:"",color=Muted,fontSize=10.sp)}}}}}
 
 @Composable private fun Profile(nav:androidx.navigation.NavHostController,onLogout:()->Unit){
     var me by remember{mutableStateOf<Me?>(null)}
@@ -1910,7 +2032,7 @@ private fun postNewLocalNotifications(context:Context,items:List<AvNotification>
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal=16.dp)) {
             Row(Modifier.fillMaxWidth().padding(top=23.dp,bottom=15.dp),verticalAlignment=Alignment.CenterVertically){Column(Modifier.weight(1f)){Row(verticalAlignment=Alignment.CenterVertically){Text("My ",fontSize=34.sp,fontWeight=FontWeight.Light,color=Color.White);Text("Profile",fontSize=34.sp,fontWeight=FontWeight.Black,color=Red)};Text("Manage your account and preferences",Modifier.padding(top=2.dp),fontSize=14.sp,color=Color(0xFFD0D5D9))};Box(Modifier.size(54.dp).border(1.dp,Color(0xFF77585B),CircleShape).clickable{nav.navigate("notifications"){launchSingleTop=true}},contentAlignment=Alignment.Center){Icon(Icons.Default.Notifications,"Notifications",tint=Color.White,modifier=Modifier.size(27.dp));if(notificationCount>0)Box(Modifier.align(Alignment.TopEnd).size(11.dp).background(Red,CircleShape))}}
             Row(Modifier.fillMaxWidth().padding(bottom=13.dp).border(1.dp,Red,RoundedCornerShape(18.dp)).background(Brush.horizontalGradient(listOf(Color(0xFF291315),Color(0xFF101315))),RoundedCornerShape(18.dp)).clickable{nav.navigate("edit-profile")}.padding(17.dp),verticalAlignment=Alignment.CenterVertically){Box(Modifier.size(83.dp).border(3.dp,Red,CircleShape).background(Color(0xFF180D0F),CircleShape),contentAlignment=Alignment.Center){Text(me?.name?.firstOrNull()?.uppercase()?:"AV",fontSize=33.sp,color=Color.White)};Column(Modifier.weight(1f).padding(start=15.dp)){Text(me?.name?:"Audience Verdict member",fontSize=21.sp,fontWeight=FontWeight.Bold,color=Color.White);Text(me?.email.orEmpty(),Modifier.padding(top=3.dp),fontSize=13.sp,color=Color(0xFFBEC5CA),maxLines=1);Text("Mobile  ${me?.mobile?.takeIf{it.isNotBlank()}?:"Not added"} | ${if(me?.mobileVerified==false)"Not verified" else "Verified"}",Modifier.padding(top=6.dp),fontSize=11.sp,color=if(me?.mobileVerified==false)Muted else Color(0xFF42D392),maxLines=1);if(!me?.alternativeMobile.isNullOrBlank()) Text("Alternative  ${me?.alternativeMobile} | ${if(me?.alternativeMobileVerified==true)"Verified" else "Not verified"}",Modifier.padding(top=3.dp),fontSize=11.sp,color=if(me?.alternativeMobileVerified==true)Color(0xFF42D392) else Muted,maxLines=1);Text("♛  Movie Lover",Modifier.padding(top=9.dp).background(Color(0xFF49161B),RoundedCornerShape(20.dp)).padding(horizontal=10.dp,vertical=5.dp),fontSize=11.sp,color=Color.White)};Icon(Icons.Default.ChevronRight,"Edit profile",tint=Muted)}
-            val rows=listOf(Triple(Icons.Default.ConfirmationNumber,"My Bookings","View and manage your bookings") to "bookings",Triple(Icons.Default.Star,"My Reviews","Reviews you have written") to "my-reviews",Triple(Icons.Default.EventAvailable,"Waiting List","See your seat offers and queue") to "waiting-list",Triple(Icons.Default.Notifications,"Notifications","Booking updates and alerts") to "notifications",Triple(Icons.Default.Person,"Edit Profile","Update your personal details") to "edit-profile",Triple(Icons.Default.HeadsetMic,"Help & Support","Get help or contact us") to "help")
+            val rows=listOf(Triple(Icons.Default.ConfirmationNumber,"My Bookings","View and manage your bookings") to "bookings",Triple(Icons.Default.Star,"My Reviews","Reviews you have written") to "my-reviews",Triple(Icons.Default.EventAvailable,"Waiting List","View your show-specific seat offers") to "waiting-list",Triple(Icons.Default.Notifications,"Notifications","Booking updates and alerts") to "notifications",Triple(Icons.Default.Person,"Edit Profile","Update your personal details") to "edit-profile",Triple(Icons.Default.HeadsetMic,"Help & Support","Get help or contact us") to "help")
             rows.forEach { (item,route)->ProfileMenuCard(item.first,item.second,item.third){nav.navigate(route){launchSingleTop=true}} }
             Row(Modifier.fillMaxWidth().padding(top=15.dp,bottom=12.dp).border(1.dp,Red,RoundedCornerShape(16.dp)).background(Color(0xFF210D10),RoundedCornerShape(16.dp)).clickable(onClick=onLogout).padding(16.dp),verticalAlignment=Alignment.CenterVertically){Icon(Icons.Default.Logout,"Logout",tint=Red,modifier=Modifier.size(27.dp));Column(Modifier.padding(start=14.dp)){Text("Logout",fontSize=16.sp,fontWeight=FontWeight.SemiBold,color=Red);Text("Sign out from your account",fontSize=12.sp,color=Muted)};Spacer(Modifier.weight(1f));Icon(Icons.Default.ChevronRight,"",tint=Muted)}
             Spacer(Modifier.height(12.dp))
@@ -1927,7 +2049,7 @@ private fun postNewLocalNotifications(context:Context,items:List<AvNotification>
     var refresh by remember{mutableIntStateOf(0)};val context=LocalContext.current
     val permissionLauncher=rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()){granted->if(granted)refresh++}
     LaunchedEffect(refresh){loading=true;error="";try{items=parseApiList(AvClient.api.notifications());postNewLocalNotifications(context,items)}catch(t:Throwable){error="Notifications could not be loaded. ${t.message.orEmpty()}"}finally{loading=false}}
-    Column(Modifier.fillMaxSize().background(Ink).verticalScroll(rememberScrollState()).padding(16.dp)) {Row(Modifier.fillMaxWidth(),verticalAlignment=Alignment.CenterVertically){Text("Notifications",Modifier.weight(1f),fontSize=21.sp,fontWeight=FontWeight.Bold,color=Color.White);if(android.os.Build.VERSION.SDK_INT>=33&&ContextCompat.checkSelfPermission(context,android.Manifest.permission.POST_NOTIFICATIONS)!=PackageManager.PERMISSION_GRANTED)TextButton(onClick={permissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)}){Text("Enable phone alerts",color=Red)};TextButton(onClick={refresh++}){Text("Refresh",color=Red)}};when{loading->Busy();error.isNotBlank()->ErrorCard(error);items.isEmpty()->Text("You're all caught up. Booking updates and account alerts will appear here.",Modifier.padding(18.dp),fontSize=14.sp,color=Muted);else->items.forEach{item->Row(Modifier.fillMaxWidth().padding(vertical=5.dp).border(1.dp,Color(0xFF33393E),RoundedCornerShape(14.dp)).background(Panel,RoundedCornerShape(14.dp)).padding(14.dp),verticalAlignment=Alignment.Top){Icon(Icons.Default.Notifications,"Notification",tint=Red,modifier=Modifier.padding(end=12.dp));Column{Text(item.title?:item.type?.replace('_',' ')?:"Audience Verdict update",fontSize=14.sp,fontWeight=FontWeight.Bold,color=Color.White);Text(item.message?:item.body.orEmpty(),Modifier.padding(top=5.dp),fontSize=12.sp,lineHeight=17.sp,color=Color(0xFFD0D5D9));item.createdAt?.let{Text(it.replace('T',' ').take(16),Modifier.padding(top=7.dp),fontSize=10.sp,color=Muted)}}}}}
+    Column(Modifier.fillMaxSize().background(Ink).verticalScroll(rememberScrollState()).padding(16.dp)) {Row(Modifier.fillMaxWidth(),verticalAlignment=Alignment.CenterVertically){Text("Notifications",Modifier.weight(1f),fontSize=21.sp,fontWeight=FontWeight.Bold,color=Color.White);if(android.os.Build.VERSION.SDK_INT>=33&&ContextCompat.checkSelfPermission(context,android.Manifest.permission.POST_NOTIFICATIONS)!=PackageManager.PERMISSION_GRANTED)TextButton(onClick={permissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)}){Text("Enable phone alerts",color=Red)};TextButton(onClick={refresh++}){Text("Refresh",color=Red)}};when{loading->Busy();error.isNotBlank()->ErrorCard(error);items.isEmpty()->Text("You're all caught up. Booking updates and account alerts will appear here.",Modifier.padding(18.dp),fontSize=14.sp,color=Muted);else->items.forEach{item->Row(Modifier.fillMaxWidth().padding(vertical=5.dp).border(1.dp,Color(0xFF33393E),RoundedCornerShape(14.dp)).background(Panel,RoundedCornerShape(14.dp)).padding(14.dp),verticalAlignment=Alignment.Top){Icon(Icons.Default.Notifications,"Notification",tint=Red,modifier=Modifier.padding(end=12.dp));Column{Text(notificationDisplayTitle(item),fontSize=14.sp,fontWeight=FontWeight.Bold,color=Color.White);Text(notificationDisplayMessage(item),Modifier.padding(top=5.dp),fontSize=12.sp,lineHeight=17.sp,color=Color(0xFFD0D5D9));item.createdAt?.let{Text(it.replace('T',' ').take(16),Modifier.padding(top=7.dp),fontSize=10.sp,color=Muted)}}}}}
     }
 }
 
@@ -1940,11 +2062,24 @@ private fun postNewLocalNotifications(context:Context,items:List<AvNotification>
     var showDetails by remember{mutableStateOf<Map<String,Show>>(emptyMap())}
     var movieTitles by remember{mutableStateOf<Map<String,String>>(emptyMap())}
     var theatreNames by remember{mutableStateOf<Map<String,String>>(emptyMap())}
+    var availabilityByShow by remember{mutableStateOf<Map<String,AvailabilityDto>>(emptyMap())}
+    var bookingsByWaitlistId by remember{mutableStateOf<Map<String,BookingRecord>>(emptyMap())}
     val context=LocalContext.current
     val scope= rememberCoroutineScope()
     suspend fun loadEntries(enrich:Boolean){
         val latest=AvClient.api.waitingList()
         entries=latest
+        bookingsByWaitlistId=runCatching {
+            val userBookings=AvClient.api.bookings().filter{it.status.uppercase() !in setOf("CANCELLED","EXPIRED","REJECTED")}
+            val linked=userBookings.filter{!it.waitingListEntryId.isNullOrBlank()}.associateBy{it.waitingListEntryId!!}
+            val byShow=userBookings.groupBy{it.showId}
+            latest.mapNotNull { entry ->
+                val linkedBooking=linked[entry.id]
+                val fallbackBooking=byShow[entry.showId].orEmpty().filter{booking->entry.createdAt.isNullOrBlank()||booking.createdAt.isNullOrBlank()||booking.createdAt>=entry.createdAt}.maxByOrNull{it.createdAt.orEmpty()}
+                (linkedBooking?:fallbackBooking)?.let{entry.id to it}
+            }.toMap()
+        }.getOrDefault(emptyMap())
+        availabilityByShow=latest.filter{it.status.uppercase() in setOf("WAITING","OFFERED")}.map{it.showId}.distinct().mapNotNull{id->runCatching{parseAvailability(AvClient.api.availability(id))}.getOrNull()?.let{id to it}}.toMap()
         if(enrich&&latest.isNotEmpty()){
             val loadedShows=latest.map{it.showId}.distinct().mapNotNull{id->runCatching{AvClient.api.show(id)}.getOrNull()?.let{id to it}}.toMap()
             showDetails=loadedShows
@@ -1956,27 +2091,32 @@ private fun postNewLocalNotifications(context:Context,items:List<AvNotification>
     LaunchedEffect(Unit){while(isActive){delay(10000);try{loadEntries(false)}catch(_:Throwable){}}}
     Column(Modifier.fillMaxSize().background(Ink).verticalScroll(rememberScrollState()).padding(16.dp)){
         Row(verticalAlignment=Alignment.CenterVertically){Text("Waiting List",Modifier.weight(1f),fontSize=21.sp,fontWeight=FontWeight.Bold,color=Color.White);TextButton(onClick={refresh++}){Text("Refresh",color=Red)}}
-        Text("Track your place and claim an offer before it expires.",Modifier.padding(top=4.dp,bottom=12.dp),fontSize=12.sp,color=Muted)
+        Text("We'll email you when seats become available. Available seats are open to everyone and use the normal booking flow.",Modifier.padding(top=4.dp,bottom=12.dp),fontSize=12.sp,color=Muted)
         when{
             loading->Busy()
             error.isNotBlank()->ErrorCard(error)
             entries.isEmpty()->Text("You haven't joined a show waiting list yet.",Modifier.padding(16.dp),color=Muted)
             else->entries.forEach{entry->
                 val status=entry.status.uppercase()
-                val active=status in setOf("WAITING","OFFERED")
-                val offered=status=="OFFERED"
-                val expired=offered&&waitingOfferExpired(entry)
+                val convertedBooking=bookingsByWaitlistId[entry.id]
+                val active=status in setOf("WAITING","OFFERED")&&convertedBooking==null
+                val availability=availabilityByShow[entry.showId]
+                val unavailable=(availability?.bookedSeatIds.orEmpty()+availability?.heldSeatIds.orEmpty()+availability?.reservedSeatIds.orEmpty()).toSet()
+                val openCount=availability?.layout?.seats.orEmpty().count{!it.disabled&&it.id !in unavailable}
+                val seatsAvailable=active&&openCount>0
                 val show=showDetails[entry.showId]
-                val dateTime=listOfNotNull(show?.date?.let(::displayMovieDate),show?.startTime).joinToString(" · ")
-                Column(Modifier.fillMaxWidth().padding(vertical=5.dp).border(1.dp,if(offered&&!expired)Red else Color(0xFF343A40),RoundedCornerShape(14.dp)).background(Panel,RoundedCornerShape(14.dp)).padding(14.dp)){
+                val dateTime=listOfNotNull(show?.date?.let(::displayMovieDate),show?.startTime).joinToString("  -  ")
+                Column(Modifier.fillMaxWidth().padding(vertical=5.dp).border(1.dp,if(seatsAvailable)Red else Color(0xFF343A40),RoundedCornerShape(14.dp)).background(Panel,RoundedCornerShape(14.dp)).padding(14.dp)){
                     Text(movieTitles[show?.movieId]?:"Movie show",fontSize=15.sp,fontWeight=FontWeight.Bold,color=Color.White)
-                    Text(buildString{append(theatreNames[show?.theatreId]?:"Show ${entry.showId}");if(dateTime.isNotBlank())append(" · $dateTime")},Modifier.padding(top=4.dp),fontSize=12.sp,color=Muted)
-                    Text("${entry.requestedSeatsCount} ticket${if(entry.requestedSeatsCount==1)"" else "s"} · ${entry.status}",Modifier.padding(top=6.dp),fontSize=12.sp,color=if(offered&&!expired)Color(0xFF50D897) else Color(0xFFD4D8DC))
-                    if(status=="WAITING")entry.position?.let{Text("Queue position: $it",Modifier.padding(top=3.dp),fontSize=11.sp,color=Muted)}
-                    if(offered)entry.offerExpiresAt?.let{Text(if(expired)"Offer expired" else "Offer expires ${displayTimestamp(it)}",Modifier.padding(top=3.dp),fontSize=11.sp,color=if(expired)Red else Muted)}
+                    Text(buildString{append(theatreNames[show?.theatreId]?:"Show ${entry.showId}");if(dateTime.isNotBlank())append("  -  $dateTime")},Modifier.padding(top=4.dp),fontSize=12.sp,color=Muted)
+                    Text(if(convertedBooking!=null)"Ticket booked from this waiting-list request" else if(seatsAvailable)"Seats are available for this show" else if(status=="CANCELLED")"Request cancelled" else if(status=="CONVERTED")"Waitlist booking complete" else "You're on the waiting list!",Modifier.padding(top=9.dp),fontSize=19.sp,fontWeight=FontWeight.Bold,color=if(convertedBooking!=null||seatsAvailable)Color(0xFF50D897) else Color.White)
+                    Text("${entry.requestedSeatsCount} ticket${if(entry.requestedSeatsCount==1)"" else "s"} requested${if(seatsAvailable)" ? $openCount seat${if(openCount==1)"" else "s"} currently available to everyone" else ""}",Modifier.padding(top=4.dp),fontSize=12.sp,color=if(seatsAvailable)Color(0xFF50D897) else Color(0xFFD4D8DC))
                     entry.createdAt?.let{Text("Joined ${displayTimestamp(it)}",Modifier.padding(top=3.dp),fontSize=10.sp,color=Muted)}
+                    if(convertedBooking!=null) {
+                        BookingCard(convertedBooking,{nav.navigate("booking-ticket/${Uri.encode(convertedBooking.id)}")},{},showCancelAction=false)
+                    }
                     if(active)Row(Modifier.fillMaxWidth().padding(top=8.dp),horizontalArrangement=Arrangement.spacedBy(8.dp)){
-                        if(offered&&!expired)Button(onClick={scope.launch{busyId=entry.id;error="";try{val claimed=AvClient.api.claimWaitingList(entry.id);loadEntries(true);if(claimed.status.equals("CONVERTED",true))nav.navigate("bookings"){launchSingleTop=true}}catch(t:Throwable){error=apiErrorMessage(t,context)}finally{busyId=""}}},Modifier.weight(1f),enabled=busyId!=entry.id,colors=ButtonDefaults.buttonColors(containerColor=Red)){Text(if(busyId==entry.id)"Claiming..." else "Claim offer",color=Color.White)}
+                        if(seatsAvailable)Button(onClick={nav.navigate("seats/${Uri.encode(entry.showId)}?waitlistEntryId=${Uri.encode(entry.id)}")},Modifier.weight(1f),colors=ButtonDefaults.buttonColors(containerColor=Red)){Text("Book available seats",color=Color.White)}
                         OutlinedButton(onClick={scope.launch{busyId=entry.id;error="";try{AvClient.api.cancelWaitingList(entry.id);entries=entries.filterNot{it.id==entry.id}}catch(t:Throwable){error=apiErrorMessage(t,context)}finally{busyId=""}}},enabled=busyId!=entry.id,border=BorderStroke(1.dp,Color(0xFF596168))){Text("Leave list",color=Color.White)}
                     }
                 }
@@ -1994,7 +2134,7 @@ private fun postNewLocalNotifications(context:Context,items:List<AvNotification>
 }
 
 @Composable private fun HelpSupportScreen(){
-    val faqs=listOf("How do I book tickets?" to "Choose a movie and showtime, select available seats, review the booking conditions, and confirm. Your booking and ticket reference appear in My Bookings after the server confirms it.","Where can I find my ticket?" to "Open Profile → My Bookings and select a confirmed booking to view the ticket and its QR code.","Why can't I select some seats?" to "Seats can be unavailable because another customer booked, reserved, or temporarily held them. Refresh the show and try another available seat.","Can I cancel a booking?" to "Open My Bookings and choose the booking. Cancellation availability and any refund depend on the show and cinema policy.","How do I join a waiting list?" to "When a show is sold out, use Join Waiting List on its seat page. If the backend offers you seats, open the entry and claim before its expiry.","I did not receive a booking update" to "Check the in-app Notifications page and confirm that your account contact details are current. If the booking is missing, contact support with your booking reference.")
+    val faqs=listOf("How do I book tickets?" to "Choose a movie and showtime, select available seats, review the booking conditions, and confirm. Your booking and ticket reference appear in My Bookings after the server confirms it.","Where can I find my ticket?" to "Open Profile  >  My Bookings and select a confirmed booking to view the ticket and its QR code.","Why can't I select some seats?" to "Seats can be unavailable because another customer booked, reserved, or temporarily held them. Refresh the show and try another available seat.","Can I cancel a booking?" to "Open My Bookings and choose the booking. Cancellation availability and any refund depend on the show and cinema policy.","How do I join a waiting list?" to "When a show is sold out, use Join Waiting List on its seat page. If the backend offers you seats, open the entry and claim before its expiry.","I did not receive a booking update" to "Check the in-app Notifications page and confirm that your account contact details are current. If the booking is missing, contact support with your booking reference.")
     var expanded by remember{mutableIntStateOf(-1)};val context=LocalContext.current
     Column(Modifier.fillMaxSize().background(Ink).verticalScroll(rememberScrollState()).padding(16.dp)){PageHeader("Help & Support"){};Text("We're here to help",fontSize=23.sp,fontWeight=FontWeight.Bold,color=Color.White);Text("Find answers or contact Audience Verdict support.",Modifier.padding(top=5.dp,bottom=15.dp),fontSize=13.sp,color=Muted);Column(Modifier.border(1.dp,Color(0xFF30383D),RoundedCornerShape(13.dp)).clip(RoundedCornerShape(13.dp))){faqs.forEachIndexed{i,pair->AboutAccordionRow(pair.first,pair.second,"?",expanded==i,{expanded=if(expanded==i)-1 else i})}};Text("Contact us",Modifier.padding(top=20.dp),fontSize=18.sp,fontWeight=FontWeight.Bold,color=Color.White);Text("Email support",Modifier.padding(top=8.dp),fontSize=12.sp,color=Muted);Text("support@audienceverdict.in",Modifier.padding(top=4.dp).clickable{val intent=Intent(Intent.ACTION_SENDTO,Uri.parse("mailto:support@audienceverdict.in"));intent.putExtra(Intent.EXTRA_SUBJECT,"Audience Verdict support");runCatching{context.startActivity(intent)}},fontSize=15.sp,fontWeight=FontWeight.SemiBold,color=Red);Text("Include your booking reference and a short description of the issue so we can help faster.",Modifier.padding(top=5.dp,bottom=20.dp),fontSize=12.sp,lineHeight=17.sp,color=Muted)}
 }
@@ -2081,7 +2221,7 @@ private data class AboutPolicy(val title:String,val detail:String,val icon:Strin
                 Text("Great movies\nstart conversations.",Modifier.padding(top=8.dp),fontSize=31.sp,lineHeight=33.sp,fontWeight=FontWeight.Black,color=Color.White)
                 Text("Audience Verdict is a platform where movies meet real audiences.",Modifier.padding(top=8.dp),fontSize=14.sp,lineHeight=19.sp,color=Color(0xFFE0E3E6))
                 Row(Modifier.padding(top=13.dp),horizontalArrangement=Arrangement.spacedBy(8.dp)) {
-                    Button(onClick={nav.navigate("movies"){launchSingleTop=true}},colors=ButtonDefaults.buttonColors(containerColor=Red),contentPadding=PaddingValues(horizontal=14.dp,vertical=8.dp),shape=RoundedCornerShape(10.dp)){Text("Explore Movies  →",fontSize=11.sp,fontWeight=FontWeight.Bold,color=Color.White)}
+                    Button(onClick={nav.navigate("movies"){launchSingleTop=true}},colors=ButtonDefaults.buttonColors(containerColor=Red),contentPadding=PaddingValues(horizontal=14.dp,vertical=8.dp),shape=RoundedCornerShape(10.dp)){Text("Explore Movies   > ",fontSize=11.sp,fontWeight=FontWeight.Bold,color=Color.White)}
                     OutlinedButton(onClick={nav.navigate("what"){launchSingleTop=true}},border=BorderStroke(1.dp,Color.White.copy(alpha=.75f)),contentPadding=PaddingValues(horizontal=11.dp,vertical=8.dp),shape=RoundedCornerShape(10.dp)){Text("▷  Watch How It Works",fontSize=10.sp,fontWeight=FontWeight.Bold,color=Color.White)}
                 }
             }
@@ -2102,7 +2242,7 @@ private data class AboutPolicy(val title:String,val detail:String,val icon:Strin
                 Text("FOR CREATORS & PRODUCERS",fontSize=9.sp,fontWeight=FontWeight.Bold,letterSpacing=1.5.sp,color=Red)
                 Text("Release your movie\nin Audience Verdict?",Modifier.padding(top=5.dp),fontSize=22.sp,lineHeight=24.sp,fontWeight=FontWeight.Black,color=Color.White)
                 Text("Bring your story to the audience with visibility, ticket bookings, real reviews, and community engagement.",Modifier.padding(top=5.dp),fontSize=10.sp,lineHeight=14.sp,color=Color(0xFFE0E3E6))
-                Text("Start the Process  →",Modifier.padding(top=8.dp).clickable{nav.navigate("what"){launchSingleTop=true}},fontSize=11.sp,fontWeight=FontWeight.Bold,color=Red)
+                Text("Start the Process   > ",Modifier.padding(top=8.dp).clickable{nav.navigate("what"){launchSingleTop=true}},fontSize=11.sp,fontWeight=FontWeight.Bold,color=Red)
             }
         }
         Text("HOW IT WORKS",Modifier.padding(start=16.dp,top=18.dp),fontSize=9.sp,fontWeight=FontWeight.Bold,letterSpacing=1.8.sp,color=Red)
@@ -2110,7 +2250,7 @@ private data class AboutPolicy(val title:String,val detail:String,val icon:Strin
         Row(Modifier.fillMaxWidth().padding(horizontal=12.dp),horizontalArrangement=Arrangement.spacedBy(6.dp)) {
             listOf("Submit Your Movie" to "Share your movie details, posters, trailer, and more.","Review & Verification" to "Our team reviews your content for quality and guidelines.","Get Listed on AV" to "Your movie can be listed with showtimes across partner cinemas.","Reach Audiences & Collect Reviews" to "Get audience views, ratings, and meaningful feedback.").forEachIndexed { index, step ->
                 Column(Modifier.weight(1f).defaultMinSize(minHeight=151.dp).border(1.dp,Color(0xFF30383D),RoundedCornerShape(10.dp)).background(Panel,RoundedCornerShape(10.dp)).padding(8.dp)) {
-                    Row(verticalAlignment=Alignment.CenterVertically){Box(Modifier.size(23.dp).background(Red,CircleShape),contentAlignment=Alignment.Center){Text("${index+1}",fontSize=11.sp,fontWeight=FontWeight.Bold,color=Color.White)};Text(if(index<2) " ✓" else " →",Modifier.padding(start=4.dp),fontSize=13.sp,color=Red)}
+                    Row(verticalAlignment=Alignment.CenterVertically){Box(Modifier.size(23.dp).background(Red,CircleShape),contentAlignment=Alignment.Center){Text("${index+1}",fontSize=11.sp,fontWeight=FontWeight.Bold,color=Color.White)};Text(if(index<2) " ✓" else "  > ",Modifier.padding(start=4.dp),fontSize=13.sp,color=Red)}
                     Text(step.first,Modifier.padding(top=8.dp),fontSize=10.sp,lineHeight=13.sp,fontWeight=FontWeight.Bold,color=Color.White)
                     Text(step.second,Modifier.padding(top=5.dp),fontSize=8.sp,lineHeight=11.sp,color=Color(0xFFCAD0D4))
                 }
@@ -2126,7 +2266,7 @@ private data class AboutPolicy(val title:String,val detail:String,val icon:Strin
                 Text("FREQUENTLY ASKED QUESTIONS",fontSize=8.sp,fontWeight=FontWeight.Bold,letterSpacing=1.1.sp,color=Red)
                 Text("Got questions?",Modifier.padding(top=4.dp),fontSize=23.sp,lineHeight=25.sp,fontWeight=FontWeight.Black,color=Color.White)
                 Text("Find answers to common questions about our platform, booking process and more.",Modifier.padding(top=6.dp),fontSize=10.sp,lineHeight=14.sp,color=Color(0xFFCAD0D4))
-                Text("View All FAQs  →",Modifier.padding(top=9.dp).border(1.dp,Red,RoundedCornerShape(8.dp)).clickable{expandedFaq=0}.padding(horizontal=9.dp,vertical=7.dp),fontSize=10.sp,fontWeight=FontWeight.Bold,color=Color.White)
+                Text("View All FAQs   > ",Modifier.padding(top=9.dp).border(1.dp,Red,RoundedCornerShape(8.dp)).clickable{expandedFaq=0}.padding(horizontal=9.dp,vertical=7.dp),fontSize=10.sp,fontWeight=FontWeight.Bold,color=Color.White)
             }
             Column(Modifier.weight(1.1f).border(1.dp,Color(0xFF30383D),RoundedCornerShape(10.dp)).clip(RoundedCornerShape(10.dp))) {
                 faqs.forEachIndexed { index, faq -> AboutAccordionRow(faq.first,faq.second,"",expandedFaq==index,{expandedFaq=if(expandedFaq==index)-1 else index},compact=true) }
@@ -2199,7 +2339,7 @@ private data class OperatingSystemSection(val index:String,val eyebrow:String,va
                             Text("01 / FEATURED FILM",fontSize=9.sp,fontWeight=FontWeight.Bold,letterSpacing=1.4.sp,color=Red)
                             Text("The AAV Story",Modifier.padding(top=7.dp),fontSize=27.sp,lineHeight=30.sp,fontWeight=FontWeight.Black,color=Color.White)
                             Text("Discover the philosophy, operating model, and execution framework behind Audience Verdict.",Modifier.padding(top=5.dp),fontSize=12.sp,lineHeight=16.sp,color=Color(0xFFE4E7E9))
-                            Text("Explore the framework  ›",Modifier.padding(top=8.dp).clickable{nav.navigate("about")},fontSize=11.sp,fontWeight=FontWeight.Bold,color=Red)
+                            Text("Explore the framework  >",Modifier.padding(top=8.dp).clickable{nav.navigate("about")},fontSize=11.sp,fontWeight=FontWeight.Bold,color=Red)
                         }
                         IconButton(onClick={if(isPrepared){videoView?.start();isPlaying=true}},modifier=Modifier.align(Alignment.BottomEnd).padding(10.dp).size(42.dp).background(Red,CircleShape),enabled=isPrepared) {
                             Icon(Icons.Default.PlayArrow,"Play the AAV story",tint=Color.White,modifier=Modifier.size(26.dp))
@@ -2212,7 +2352,7 @@ private data class OperatingSystemSection(val index:String,val eyebrow:String,va
                             Icon(Icons.Default.Stop,"Stop video and show title",tint=Color.White)
                         }
                     }
-                    if(!isPrepared&&!isPlaying) Text("Loading video…",Modifier.align(Alignment.BottomStart).padding(12.dp),fontSize=9.sp,color=Color.White.copy(alpha=.8f))
+                    if(!isPrepared&&!isPlaying) Text("Loading video...",Modifier.align(Alignment.BottomStart).padding(12.dp),fontSize=9.sp,color=Color.White.copy(alpha=.8f))
                 }
                 Text("THE AUDIENCE VERDICT OPERATING SYSTEM",Modifier.padding(top=22.dp,bottom=9.dp),fontSize=11.sp,fontWeight=FontWeight.Bold,letterSpacing=1.3.sp,color=Red)
             }
@@ -2224,7 +2364,7 @@ private data class OperatingSystemSection(val index:String,val eyebrow:String,va
                         Text("${section.index} / ${section.eyebrow}",fontSize=8.sp,fontWeight=FontWeight.Bold,letterSpacing=.7.sp,color=Red,maxLines=1)
                         Text(section.title,Modifier.padding(top=4.dp),fontSize=14.sp,lineHeight=17.sp,fontWeight=FontWeight.Bold,color=Color.White,maxLines=2)
                         Text(section.body,Modifier.padding(top=4.dp),fontSize=10.sp,lineHeight=13.sp,color=Color(0xFFC8CED3),maxLines=3)
-                        Text("${section.action}  ›",Modifier.padding(top=5.dp).clickable{nav.navigate("about")},fontSize=9.sp,fontWeight=FontWeight.Bold,color=Red,maxLines=1)
+                        Text("${section.action}  >",Modifier.padding(top=5.dp).clickable{nav.navigate("about")},fontSize=9.sp,fontWeight=FontWeight.Bold,color=Red,maxLines=1)
                     }
                     if(!imageOnLeft) Image(painterResource(section.image),section.title,Modifier.weight(.92f).padding(start=11.dp).height(105.dp).clip(RoundedCornerShape(9.dp)).background(Color.White),contentScale=ContentScale.Crop)
                 }
@@ -2236,7 +2376,7 @@ private data class OperatingSystemSection(val index:String,val eyebrow:String,va
                     Text("THE NEXT CHAPTER",fontSize=9.sp,fontWeight=FontWeight.Bold,letterSpacing=1.sp,color=Red)
                     Text("Make every audience voice count.",Modifier.padding(top=4.dp),fontSize=19.sp,lineHeight=22.sp,fontWeight=FontWeight.Bold,color=Color.White)
                     Text("Explore films, meet the audience, and build a stronger conversation around cinema.",Modifier.padding(top=4.dp),fontSize=10.sp,lineHeight=13.sp,color=Color(0xFFD2D6DA))
-                    Text("Explore movies  ›",Modifier.padding(top=5.dp).clickable{nav.navigate("movies")},fontSize=10.sp,fontWeight=FontWeight.Bold,color=Red)
+                    Text("Explore movies  >",Modifier.padding(top=5.dp).clickable{nav.navigate("movies")},fontSize=10.sp,fontWeight=FontWeight.Bold,color=Red)
                 }
             }
             Spacer(Modifier.height(14.dp))
